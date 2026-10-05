@@ -1,0 +1,39 @@
+# ── luadevirt (monorepo root) ─────────────────────────────────────────
+# Each project under its subdirectory ships its own .gitignore; these are
+# the shared rules that apply across the whole tree.
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# Editors / OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Temporary & intermediate files
+*.tmp
+*.log
+
+# Run products / captured material (never belongs in git)
+work/
+**/work/*
+!**/work/.gitkeep
+output/*
+!output/.gitkeep
+
+# Secrets / local config (script keys, HWIDs, cookies — never commit)
+.env
+*.key
+script_key.txt
+
+# local-only notes (not committed)
+*.local.md
