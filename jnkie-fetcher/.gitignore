@@ -1,0 +1,25 @@
+# Tool by @adi.codz (Discord)
+# Captured material and transient payloads never belong in git.
+work/*
+!work/.gitkeep
+*.raw.txt
+*.bin
+out.lua
+*.luau
+luarmor_out/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Secrets / local config (keys, cookies — never commit)
+.env
+*.key
+script_key.txt
+
+# local-only notes (not committed)
+*.local.md
