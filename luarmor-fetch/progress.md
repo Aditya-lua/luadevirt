@@ -4,6 +4,41 @@ Chronological research/engineering log for Luarmor-Fetch. Newest entries on top.
 
 ---
 
+## 2026-10-05 — Second end-to-end validation on a fresh, keyless loader
+
+Independent re-run of the full chain against a different, **keyless** v4 script
+(module `f07dbcbe19a-sephal`). Confirms the pipeline generalizes beyond the
+2026-10-01 keyed run, and that a keyless script needs **no `script_key`** at any
+stage.
+
+```
+fetch     handshake -> 200 session-response (622 B)   signature accepted
+two-phase round 1    -> session-response (628 B)
+two-phase round 2    -> json (313,124 B)               encrypted client chunk
+loadstring() of 308,359 bytes                          decrypted client
+run finished: fetches=2 states=- kicked=False
+```
+
+- **Environment.** The shipped `bin/luau` still aborts with `SIGILL` on this
+  container's CPU (`--help` works, any script faults). Rebuilt a compatible
+  `luau` 0.739 from source with the writable-vector-metatable patch
+  (`build_luau.py` logic) and pointed `--luau` at it; preflight passes.
+- **Init still executor-gated.** `cdn.luarmor.net/v4_init_sephal.lua` serves the
+  327-byte "executor not supported" trap to us; the run used a cached init
+  supplied for this module (764,123 B; blob 9631, chunk 754299).
+- **Shape differs from 2026-10-01.** This client is smaller and comes back in
+  **2 rounds, not 3** (624,009 B / Luraph v14.7 before). The recovered payload
+  is a *bare* Luraph VM — `return setmetatable({...}, ...)` with
+  `V="Luraph Decompression Error: "` and the `LPH$` magic — with **no**
+  plaintext `-- protected using Luraph Obfuscator vX` header and **no** Luarmor
+  whitelist wrapper. So `probe` reports `not luarmor (0.00)`, which is correct:
+  the Luarmor layer is fully peeled and what remains is the inner Luraph layer
+  (the sibling devirtualizer's stage).
+- **Entry patch not required here.** `patch_entries` was skipped (the repo's
+  prebuilt `bin/luau-ast` is not runnable on this CPU) and the chain still
+  completed — the `patch_spin` rewrite alone reaches the handshake and drives
+  the NEEDFETCH/resume loop to client recovery for this loader.
+
 ## 2026-10-01 — Full chain completes: past State848, client recovered
 
 First end-to-end run with a **real script key** (fresh loader, cached sephal
