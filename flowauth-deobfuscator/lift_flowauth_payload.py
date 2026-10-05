@@ -6,12 +6,16 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = HERE  # this script lives at the repo root
-MAIN = "/home/z/my-project/Deobfuscator-Luraph-V15"
-sys.path.insert(0, os.path.join(MAIN, "core"))
+sys.path.insert(0, HERE)
+from _repo_path import main_repo  # noqa: E402
+
+MAIN = main_repo()
 
 from obfuscators.luraph_v15 import devirt  # noqa: E402
 
 SRC = os.path.join(ROOT, "flowauth_crack", "work", "payload_devirt.lua")
+if not os.path.exists(SRC):  # fresh clone: work/ is gitignored, use tracked capture
+    SRC = os.path.join(ROOT, "flowauth_capture", "payload_devirt.lua")
 DUMP = os.path.join(ROOT, "flowauth_capture", "capture_protos.json.gz")
 OUT = os.path.join(ROOT, "flowauth_capture", "payload_lift.lua")
 

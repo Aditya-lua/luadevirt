@@ -2,6 +2,59 @@
 
 > Updated every session so context is never lost. Latest entry first.
 
+## 2026-10-05 — monorepo toolchain revival + blocker-map refresh (lf149 is GONE)
+
+Session scope (user): "Continue". The project now lives in the **`luadevirt`
+monorepo** (`Aditya-lua/luadevirt`), FlowAuth under `flowauth-deobfuscator/`, the
+sandbox repo as the sibling `deobfuscator-luraph-v15/` (lowercase). The old
+handoff/`progress.md` paths (`/home/z/my-project/…`) no longer exist here.
+
+**Root cause (toolchain was dead on this machine).** The root-level devirt/lift
+probes still hardcoded `MAIN = "/home/z/my-project/Deobfuscator-Luraph-V15"` at
+import time → `ModuleNotFoundError`, nothing ran. The chain drivers had already
+been de-hardcoded (2026-09-30 via `flowauth_loader.find_repo`); the root probes
+were missed.
+
+**Fix (minimal, matches the prior de-hardcoding).**
+- New `_repo_path.py` (`main_repo()`): delegates to `flowauth_loader.find_repo`
+  (explicit → `FLOWAUTH_REPO` → sibling/home scan, both CamelCase + lowercase
+  basenames) and puts the repo's `core/` on `sys.path`. `find_repo` already scans
+  the parent dir, so from `flowauth-deobfuscator/` it finds the sibling.
+- Routed `devirt_full.py`, `lift_new_capture.py`, `lift_flowauth_payload.py`,
+  `probe_progress.py` through `main_repo()`; fixed `patch_payload.js` to resolve
+  the sibling relatively (`__dirname`/`FLOWAUTH_REPO`) instead of absolute paths.
+- Added fresh-clone `SRC` fallbacks (work/ is gitignored → fall back to the
+  tracked `flowauth_capture/payload_devirt.lua`), same pattern as
+  `reassemble_payload.py`.
+
+**Verified live in this container** (16 GB RAM, luau runs — no SIGILL here):
+1. Round-1 lift from the tracked capture reproduces **53 fns** (now 10,069 B; the
+   sibling lifter has advanced since the 8,837 B tracked reference — same 53 fns).
+2. Grind-kill capture regenerated offline from the tracked payload
+   (`DEVIRT_TRACE_DEBUG=1 python3 devirt_full.py`): clean abort rc=0 at ~35 s,
+   **163 MB dump = 423,934 protos**, trace shows the real UI builder
+   (`UIScale`, `UISizeConstraint`, `Vector2.new(25,1)`) — matches §6 exactly.
+3. New-capture lift (`lift_new_capture.py`) runs end-to-end → 46,050 B, parses
+   (luau-ast OK), 1 root (t141697, 423,934 caps).
+
+**Blocker-map refresh (important — §8 is partly stale).** The handoff's headline
+blocker **"call of unknown VM function lf149" (env-slot helper binding) is GONE** —
+the current sibling lifter binds those helpers. Remaining error markers on the
+single-root lift (57 total): **48× `index nil`** (lazy/encrypted constant slots
+the single trace never decoded — cluster on offsets `272,644812` and
+`272,676217`), **9× `arith on None None`** (arithmetic on those unresolved
+constants), **1× `closure maker did not return`** (the wrapper factory, §8 #2 —
+now a single site). `requests=0`: `lift_new_capture.py` does a single static pass.
+
+**Still pending (the real next wave, unchanged in substance):**
+- Lazy constants → run the full `devirt_full.py main()` pipeline (`ldrv.run`,
+  constant rounds) so the sandbox decodes the requested slots and the index-nil /
+  arith-None markers clear.
+- The real payload logic (the UI builders) lives in the **20 entered child
+  protos**, not the single root; they need lifting + splicing
+  (`DEVIRT_SHALLOW` / `tools/lift_all.py` approach from the RaceforEggs note).
+- Wrapper factory: follow the wrapper → inner VM closure for the one remaining site.
+
 ## 2026-09-30 — generalized the fetcher: fetch the obfuscated payload for ANY loader URL
 
 Session scope (user): "make my FlowAuth fetcher actually be able to fetch actual

@@ -3,10 +3,15 @@
 in the sandbox env with call counters printing every 1M calls, so the
 stalled phase reveals which library (if any) it churns. Pure-operator
 compute (bignum etc.) prints nothing -> grind it out with a bigger stall."""
+import os
 import sys
 
-sys.path.insert(0, "/home/z/my-project/Deobfuscator-Luraph-V15/core")
-import harness
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from _repo_path import main_repo  # noqa: E402
+
+main_repo()
+import harness  # noqa: E402
 
 PRELUDE = r"""
 local E = env
@@ -62,7 +67,10 @@ report(true)
 rprint("PROG wrappers armed")
 """
 
-src = open("/home/z/my-project/FlowAuth-Deobfuscator/flowauth_crack/work/payload_devirt.lua", encoding="latin1").read()
+_src_path = os.path.join(HERE, "flowauth_crack", "work", "payload_devirt.lua")
+if not os.path.exists(_src_path):
+    _src_path = os.path.join(HERE, "flowauth_capture", "payload_devirt.lua")
+src = open(_src_path, encoding="latin1").read()
 cfg = {"time_budget": 30, "executor": "Wave", "devirt": False, "spin": 24,
        "trace_globals": True, "prelude": PRELUDE}
 body, err = harness.run_once(harness.find_luau(), src, cfg, "/tmp/probe3.luau", 240, True)

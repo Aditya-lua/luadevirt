@@ -27,14 +27,18 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MAIN = "/home/z/my-project/Deobfuscator-Luraph-V15"
-sys.path.insert(0, os.path.join(MAIN, "core"))
+sys.path.insert(0, HERE)
+from _repo_path import main_repo  # noqa: E402
+
+MAIN = main_repo()
 
 import harness  # noqa: E402
 from obfuscators.base import Job  # noqa: E402
 from obfuscators.luraph_v15 import driver as ldrv  # noqa: E402
 
 SRC = os.path.join(HERE, "flowauth_crack", "work", "payload_devirt.lua")
+if not os.path.exists(SRC):  # fresh clone: work/ is gitignored, use tracked capture
+    SRC = os.path.join(HERE, "flowauth_capture", "payload_devirt.lua")
 OUT_BASE = os.path.join(HERE, "flowauth_crack", "work", "payload_full")
 
 BUDGET = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("TIME_BUDGET", "400"))
