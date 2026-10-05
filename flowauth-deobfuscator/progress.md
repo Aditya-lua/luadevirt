@@ -65,16 +65,46 @@ single-root lift renders the VM-bootstrap / anti-tamper layer (53 fns); the real
 payload logic (the UI builders seen in the trace as `@1` statements) lives in the
 entered child protos and is NOT in that root output.
 
+**Entered-proto lift built + working (new `lift_entered.py`).** Recovered the
+entered-pid → cap keying for the current capture: `dump.pid_of_table` inverts to
+20 entered pids; each pid's W/V-state cap is `cap_by_self[table_tid + 1]`
+(confirmed for all 20; matches §8's "caps at tid+1"). `lift_child.py` keyed by the
+*table* tid finds no cap and silently re-lifts the root — so the cap tid (tid+1)
+is required. `lift_entered.py` builds the Program once and lifts all 20 entered
+protos error-tolerantly → **20/20 lifted, 76 fns, parses clean** (289 KB).
+Far cheaper than 20× `lift_child` (one 38 s Program build vs one per proto).
+
+**codegen fix (shared core, generic — `core/codegen.py`).** The entered-proto
+output first failed to parse: a captured Lua **thread** value was rendered as its
+raw runtime tostring `thread: 0x…` inside a table constructor. Root cause:
+`Opaque` rendering returned `e.src` verbatim, and for a non-code runtime handle
+`src` is `"<type>: 0x<addr>"` (not valid Luau). Fix: when `src` is a bare
+runtime-handle tostring (`thread|userdata|function|table|proto|vector|cdata:
+0x…`), keep it in a comment and emit a parse-safe `nil` (the same fallback the
+empty-src path already used). 9 sites; output now parses. Validated: sibling
+`test/unit_test.py` 16/16 and `node test/run.js` 36/36 (2 skipped) still green.
+
+**HONEST status of the entered-proto output.** It parses and covers the 20
+executed protos, but it is the **VM-level reconstruction**, NOT readable
+source: bodies are `luraph_runtime1(N)` helper-frame calls + register-slot math
+with anti-tamper magic-number checks (`[4] ~= 917763002`) and residual
+`index nil` markers. The clean high-level logic (the `Instance.new` / UI-builder
+calls) is only in the **behavioral trace** (`payload_full.trace.txt`), because
+the static lift does not yet resolve the `luraph_runtime1(N)` VM-helper
+indirection or the lazy constant slots. So readable *behaviour* is recovered;
+fully readable *source* of the entered protos is not yet.
+
 **Still pending (the real next wave):**
-- Recover the entered child protos' source: extract the entered pids from the
-  current trace (the `@<pid>` / enter markers), map each to its cap, lift with
-  `tools/lift_child.py` (one tid standalone — the right targeted tool, not
-  `lift_all`), and assemble. This is iterative research, not a one-liner.
+- Resolve the `luraph_runtime1(N)` VM-helper indirection so entered-proto bodies
+  render as Lua ops instead of frame-pack calls — the gate to source-level output.
+- Re-diagnose the 48 `index nil` + 9 `arith on None None` on the current lifter
+  (not live-fetch constant requests; likely symbolic-exec table-index gaps).
 - Wrapper factory: follow the wrapper → inner VM closure for the one remaining
   `closure maker did not return` site (devirt.py).
-- The 48 `index nil` + 9 `arith on None None` need their mechanism re-diagnosed
-  on the current lifter (they are not live-fetch constant requests — likely
-  symbolic-exec table-index gaps in paths that only resolve inside entered protos).
+
+**Artifacts (gitignored `work/`, regenerate with the commands above):**
+`payload_full.protos.json(.gz)` (423,934 protos), `payload_full.devirt.luau`
+(root, 47 KB), `payload_entered.devirt.luau` (20 entered protos, 289 KB, parses).
 
 ## 2026-09-30 — generalized the fetcher: fetch the obfuscated payload for ANY loader URL
 

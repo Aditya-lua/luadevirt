@@ -1510,6 +1510,12 @@ class Renderer:
         if isinstance(e, SymList):
             return "table.pack(%s)" % self.multi(Multi(e.items, e.tail))
         if type(e).__name__ == "Opaque":
+            # a bare runtime-handle tostring (thread/userdata/function/table: 0xADDR)
+            # is a live engine value, not reconstructable code -- emitting it raw
+            # breaks the parse, so keep it in a comment and fall back to nil.
+            if e.src and re.match(r"^(thread|userdata|function|table|proto|vector|cdata):"
+                                  r" (builtin: )?0x[0-9a-fA-F]+$", e.src):
+                return "nil --[[ %s ]]" % e.src
             return e.src or "nil --[[ %s ]]" % e.kind
         if type(e).__name__ == "Vec":
 
