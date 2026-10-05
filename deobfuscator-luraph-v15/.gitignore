@@ -18,6 +18,10 @@ output/*
 !output/.gitkeep
 work/
 work_raceforeggs/
+work_bfmain/
+
+# Runtime-generated sandbox harness (never source)
+*.harness.luau
 
 # local-only notes (not committed)
 *.local.md
