@@ -49,13 +49,13 @@ def patch_entries(source, path):
     tag = harness.chunk_key(source)
     for info in vmmap.maker_info(root):
         (l2, c2), var, pv = info["at"], info["var"], info["proto"]
-        code = " __PF[%s]=%s " % (var, info.get("pf_key", pv))
+        code = " if (%s)~=nil then __PF[%s]=%s end " % (var, var, info.get("pf_key", pv))
 
         cap = "".join("__PA[%s].%s=%s;" % (pv, nm, nm) for nm in info["captures"])
 
-        code += ("if __PA and not __PA[%s] then __PA[%s]={};__PA.n=__PA.n+1;__PA[%s].__seq=__PA.n;"
+        code += ("if __PA and (%s)~=nil and not __PA[%s] then __PA[%s]={};__PA.n=__PA.n+1;__PA[%s].__seq=__PA.n;"
                  "__PA[%s].__maker=\"%s@%d,%d\";__PK[%s]=%s;%s end "
-                 % (pv, pv, pv, pv, tag, l2, c2, info.get("pf_key", pv), var, cap))
+                 % (pv, pv, pv, pv, pv, tag, l2, c2, info.get("pf_key", pv), var, cap))
         edits.append((l2, c2, code))
     for l, c, code in sorted(edits, reverse=True):
         lines[l] = lines[l][:c] + code + lines[l][c:]

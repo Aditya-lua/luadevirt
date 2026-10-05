@@ -51,10 +51,12 @@ To reconstruct valid, clean Luau source code, the engine executes a multi-pass p
 - The input script is parsed into a Luau AST using `luau-ast`.
 - The engine identifies VM dispatch loops and closure maker functions.
 - Non-invasive hooks are inserted into each closure maker to capture proto metadata, instruction arrays, and closure environments without changing execution behavior.
+- A maker's proto/closure variables can read nil at the hook site (a maker invoked before the proto is assigned, or a dispatch-local maker reached on a setup path). Every hook key is therefore nil-guarded (`if (v)~=nil then __PF[v]=... end`, `__PA[pv]` behind `(pv)~=nil and ...`): a nil-keyed table write raises `table index is nil`, and because the hooks run *inside* the script it would abort the whole run before any `\0TRIGGER` could be reported, collapsing capture to a single proto. The guards keep both the JS (`src/vmmap.js`) and Python (`core/obfuscators/luraph_v15/driver.py`) instrumenters in sync; skipping a nil key only drops a maker call that was not creating a proto.
 
 ### Stage 2: Sandboxed Simulation & Trap Handling (`driver.js`, `harness.js`)
 - The hooked script executes inside a sandboxed Luau runtime (`envlog.luau`).
 - If an execution path hits an anti-tamper trap (`\0TRIGGER <pid>`), the engine identifies the responsible function, isolates it, and re-executes along stable code paths.
+- **Compressed bootstrap variant.** Some Luraph v15 outputs ship a self-decompressing loader — `return setmetatable({ ..., q=[=[LPH$...]=], R={...}, V="Luraph Decompression Error: ", n=function(g) ... end }, {}):n()(...)` — whose `n` is a pure-Luau range-coder that `loadstring`s the real VM chunk. The sandbox captures that chunk through its `loadstring` hook (`\0CHUNK`), re-instruments it, and devirtualizes it like a top-level script, so no separate unpacking step is needed; detection scores these headerless loaders by the `setmetatable({`/`buffer.*`/`LPH` shape.
 
 ### Stage 3: Symbolic Execution & Live Memory Decryption (`devirt_bridge.py`, `driver.py`, `luasym.py`)
 - The Node driver hands the trace to the Python core through `src/devirt_bridge.py` (one `pipeline` invocation per run; a big-stack thread protects the deep recursion).

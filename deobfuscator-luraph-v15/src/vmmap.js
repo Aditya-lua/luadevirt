@@ -399,7 +399,7 @@ function patchEntries(source, filePath, chunkTag) {
     const pv = info.proto;
     const v = info.var;
     const pfKey = info.pf_key || pv;
-    let code = ` __PF[${v}]=${pfKey} `;
+    let code = ` if (${v})~=nil then __PF[${v}]=${pfKey} end `;
     const cap = info.captures.map(nm => `__PA[${pv}].${nm}=${nm};`).join('');
     // __PA.n cap: dispatch-local protos are keyed by a FRESH table per call
     // (A[49](x)) -- without a cap every call re-registers 14 captures and
