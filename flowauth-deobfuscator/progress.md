@@ -46,14 +46,35 @@ the single trace never decoded — cluster on offsets `272,644812` and
 constants), **1× `closure maker did not return`** (the wrapper factory, §8 #2 —
 now a single site). `requests=0`: `lift_new_capture.py` does a single static pass.
 
-**Still pending (the real next wave, unchanged in substance):**
-- Lazy constants → run the full `devirt_full.py main()` pipeline (`ldrv.run`,
-  constant rounds) so the sandbox decodes the requested slots and the index-nil /
-  arith-None markers clear.
-- The real payload logic (the UI builders) lives in the **20 entered child
-  protos**, not the single root; they need lifting + splicing
-  (`DEVIRT_SHALLOW` / `tools/lift_all.py` approach from the RaceforEggs note).
-- Wrapper factory: follow the wrapper → inner VM closure for the one remaining site.
+**Tried this session — the full-pipeline constant round is a NO-OP here.** Ran
+`python3 devirt_full.py` (full `ldrv.run`, budget 400 / rounds 200 / max_runs 4,
+grind-kill 18s): clean, 284 s, rc=0 → `payload_full.devirt.luau` 47,175 B / 1,911
+lines. But the lifter emitted **`constants decoded on request: calls=0 decoded=0`,
+`0 new constant requests`** — the root-proto walk never surfaces the 48 `index nil`
+sites as decode-requests, so the live-fetch loop cannot satisfy them. Result is
+the same 53 fns / 57 unlifted blocks as the single static pass. **Conclusion: the
+remaining markers are NOT lazy-constant-decode requests** — "lazy constants via
+live-fetch loop" (the old next-wave hypothesis) does not apply to this payload.
+
+**Entered-proto reality (the §8 map is stale).** `dump.protos` holds **all
+423,934** captured protos (not a RaceforEggs-style ~119), so `tools/lift_all.py`
+(lifts every proto) is infeasible here. There is no stored `entered_pids`; the
+"20 entered pids → caps at tid+1" list in §8 was derived from the OLD capture's
+trace and does not carry over (per-run tids; this run's root is **t141697**). The
+single-root lift renders the VM-bootstrap / anti-tamper layer (53 fns); the real
+payload logic (the UI builders seen in the trace as `@1` statements) lives in the
+entered child protos and is NOT in that root output.
+
+**Still pending (the real next wave):**
+- Recover the entered child protos' source: extract the entered pids from the
+  current trace (the `@<pid>` / enter markers), map each to its cap, lift with
+  `tools/lift_child.py` (one tid standalone — the right targeted tool, not
+  `lift_all`), and assemble. This is iterative research, not a one-liner.
+- Wrapper factory: follow the wrapper → inner VM closure for the one remaining
+  `closure maker did not return` site (devirt.py).
+- The 48 `index nil` + 9 `arith on None None` need their mechanism re-diagnosed
+  on the current lifter (they are not live-fetch constant requests — likely
+  symbolic-exec table-index gaps in paths that only resolve inside entered protos).
 
 ## 2026-09-30 — generalized the fetcher: fetch the obfuscated payload for ANY loader URL
 
