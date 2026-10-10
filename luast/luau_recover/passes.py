@@ -188,7 +188,30 @@ def value_node(value: Any) -> Node:
     raise TypeError(type(value).__name__)
 
 
+class Truthiness:
+    """A value known only by its truth: a recorded branch decision
+    (`if x then` taken means x is truthy, not that x is `true`). Truth
+    tests use it; comparisons, arithmetic and calls must treat it as
+    unknown."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: bool):
+        self.value = bool(value)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Truthiness) and other.value == self.value
+
+    def __hash__(self) -> int:
+        return hash(("truthiness", self.value))
+
+    def __repr__(self) -> str:
+        return "Truthiness(%s)" % self.value
+
+
 def truthy(value: Any) -> bool:
+    if isinstance(value, Truthiness):
+        return value.value
     return value is not UNKNOWN and value is not None and value is not False
 
 

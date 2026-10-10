@@ -7,7 +7,7 @@ from typing import Any
 from .analysis import Analyzer, Binding, binding_for
 from .emitter import Emitter
 from .model import Node, children, clone_value, count_nodes, walk
-from .passes import UNKNOWN, bool_const, constant_environment, evaluate, is_number, is_int, numeric_result, truthy, builtin_call, value_node, is_phi, phi_apply, phi_binop, phi_from_leaves, unphi
+from .passes import UNKNOWN, Truthiness, bool_const, constant_environment, evaluate, is_number, is_int, numeric_result, truthy, builtin_call, value_node, is_phi, phi_apply, phi_binop, phi_from_leaves, unphi
 
 
 EXIT = ("exit", None)  # virtual sink for post-dominators (break/return/dead)
@@ -347,6 +347,8 @@ class DispatcherPass:
             return self.eval_data(node.get("expr"), state, value, env)
         if node.kind == "unop":
             inner = self.eval_data(node.get("expr"), state, value, env)
+            if isinstance(inner, Truthiness):
+                return Truthiness(not inner.value) if node.get("op") == "not" else UNKNOWN
             if is_phi(inner):
                 if node.get("op") == "not":
                     return phi_apply(lambda item: not truthy(item), inner)
@@ -379,10 +381,14 @@ class DispatcherPass:
                 return left if truthy(left) else self.eval_data(node.get("right"), state, value, env)
             left = self.eval_data(node.get("left"), state, value, env)
             right = self.eval_data(node.get("right"), state, value, env)
+            if isinstance(left, Truthiness):
+                left = UNKNOWN
+            if isinstance(right, Truthiness):
+                right = UNKNOWN
             if is_phi(left) or is_phi(right):
                 return phi_binop(operator, left, right)
             if operator in {"==", "~=", "<", "<=", ">", ">="} and (left is UNKNOWN or right is UNKNOWN):
-                folded = _junk_truth(node, lambda item: unphi(self.eval_data(item, state, value, env)))
+                folded = _junk_truth(node, lambda item: self.known_value(item, state, value, env))
                 if folded is not None:
                     return folded
             if left is UNKNOWN or right is UNKNOWN:
@@ -408,6 +414,8 @@ class DispatcherPass:
         if node.kind == "call":
             name = self.dotted_name(node.get("func"))
             args = [self.eval_data(argument, state, value, env) for argument in node.get("args", [])]
+            if any(isinstance(argument, Truthiness) or is_phi(argument) for argument in args):
+                return UNKNOWN
             return builtin_call(name, args)
         if node.kind == "ifexpr":
             all_leaves = [node.get("then")] + [branch_value for _, branch_value in node.get("elifs", [])] + [node.get("else_")]
@@ -429,6 +437,10 @@ class DispatcherPass:
                 index += 1
             return self.eval_data(node.get("else_"), state, value, env)
         return UNKNOWN
+
+    def known_value(self, node: Node, state: Binding, value: int | float, env: dict[int, Any]) -> Any:
+        result = unphi(self.eval_data(node, state, value, env))
+        return UNKNOWN if isinstance(result, Truthiness) else result
 
     def eval_state(self, node: Node, state: Binding, value: int | float, env: dict[int, Any]) -> int | float:
         result = self.eval_data(node, state, value, env)
@@ -487,13 +499,13 @@ class DispatcherPass:
         if current.kind == "name":
             binding = binding_for(self.analyzer, current)
             if binding is not None and (state is None or binding is not state):
-                env[binding.ident] = value
+                env[binding.ident] = Truthiness(value)
         elif current.kind == "unop" and current.get("op") == "not":
             inner = current.get("expr")
             if isinstance(inner, Node) and inner.kind == "name":
                 binding = binding_for(self.analyzer, inner)
                 if binding is not None and (state is None or binding is not state):
-                    env[binding.ident] = not value
+                    env[binding.ident] = Truthiness(not value)
 
     def execute(self, statements: list[Node], state: Binding, value: int | float, conditions: list[tuple[Node, bool, int]], actions: list[Node], depth: int = 0, env: dict[int, Any] | None = None) -> list[DispatchPath]:
         self.work += 1
@@ -738,8 +750,14 @@ class DispatcherPass:
                 # different knowledge. Weaken to the shared subset and
                 # reprocess instead of giving up on the dispatcher.
                 merged = {k: v for k, v in incoming_env.items() if k in existing and existing[k] == v}
-                if merged == existing or requeues.get(key, 0) >= 3:
+                if merged == existing:
                     continue
+                if requeues.get(key, 0) >= 3:
+                    # stop narrowing step by step, but never keep a graph
+                    # entry computed under knowledge some path lacks
+                    merged = {}
+                    if existing == merged:
+                        continue
                 requeues[key] = requeues.get(key, 0) + 1
                 seen[key] = merged
                 incoming_env = merged
