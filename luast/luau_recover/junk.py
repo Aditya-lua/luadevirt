@@ -489,15 +489,91 @@ def _is_probeable(node: Node | None) -> bool:
     return False
 
 
+_COMPARISONS = {"==", "~=", "<", "<=", ">", ">="}
+
+
+def _difference(left: Any, right: Any) -> Any:
+    if isinstance(left, Vector3) and isinstance(right, Vector3):
+        return Vector3(left.x - right.x, left.y - right.y, left.z - right.z)
+    if is_number(left) and is_number(right):
+        return left - right
+    return None
+
+
+def _is_zero(value: Any) -> bool:
+    if isinstance(value, Vector3):
+        return value.x == 0 and value.y == 0 and value.z == 0
+    return value == 0
+
+
+def _same(first: Any, second: Any) -> bool:
+    if isinstance(first, Vector3) and isinstance(second, Vector3):
+        return first.x == second.x and first.y == second.y and first.z == second.z
+    if is_number(first) and is_number(second):
+        return first == second
+    return type(first) is type(second) and first == second
+
+
+def _decide(op: str, pairs: list[tuple[Any, Any]]) -> bool | None:
+    """Verdict from sampled (left, right) values that holds for *every*
+    input, not just the sampled ones: either both sides agree on all
+    samples (a polynomial identity, Schwartz-Zippel) or they differ by the
+    same constant on all samples. Anything else depends on the actual
+    values (operands are often correlated through earlier statements, so
+    'false on random inputs' proves nothing)."""
+    differences = [_difference(left, right) for left, right in pairs]
+    if all(_same(left, right) for left, right in pairs):
+        difference: Any = 0
+    elif any(item is None for item in differences) or not all(_same(item, differences[0]) for item in differences):
+        return None
+    else:
+        difference = differences[0]
+    if _is_zero(difference):
+        return {"==": True, "~=": False, "<=": True, ">=": True, "<": False, ">": False}[op]
+    if isinstance(difference, Vector3):
+        return {"==": False, "~=": True}.get(op)
+    return {"==": False, "~=": True, "<": difference < 0, "<=": difference < 0, ">": difference > 0, ">=": difference > 0}[op]
+
+
+def _mod_shift_truth(node: Node, base_eval: Callable[[Node], Any]) -> bool | None:
+    """`X % n == (X + d) % n`: equal exactly when d is a multiple of n
+    (Lua floor-modulo); luast's most common arithmetic junk."""
+    op = node.get("op")
+    if op not in {"==", "~="}:
+        return None
+    sides = (_strip(node.get("left")), _strip(node.get("right")))
+    for plain, shifted in (sides, sides[::-1]):
+        if not (isinstance(plain, Node) and isinstance(shifted, Node)):
+            continue
+        if plain.kind != "binop" or plain.get("op") != "%" or shifted.kind != "binop" or shifted.get("op") != "%":
+            continue
+        modulus_a = base_eval(plain.get("right"))
+        modulus_b = base_eval(shifted.get("right"))
+        if not (is_number(modulus_a) and is_number(modulus_b)) or modulus_a != modulus_b or modulus_a == 0:
+            continue
+        inner = _strip(shifted.get("left"))
+        if not (isinstance(inner, Node) and inner.kind == "binop" and inner.get("op") == "+"):
+            continue
+        if _render(_strip(inner.get("left"))) != _render(_strip(plain.get("left"))):
+            continue
+        offset = base_eval(_strip(inner.get("right")))
+        if not is_number(offset):
+            continue
+        equal = offset % modulus_a == 0
+        return equal if op == "==" else not equal
+    return None
+
+
 def _probe_truth(node: Node, base_eval: Callable[[Node], Any]) -> bool | None:
-    """Random-probe a predicate: fold only when truth is input-invariant."""
+    """Random-probe a comparison: fold only when truth is input-invariant."""
     cached = _verdict_cache.get(id(node))
     if cached is not None and cached[0] is node:
         return cached[1]
     result: bool | None = None
+    op = node.get("op")
     left = _strip(node.get("left"))
     right = _strip(node.get("right"))
-    if _is_probeable(left) and _is_probeable(right):
+    if op in _COMPARISONS and _is_probeable(left) and _is_probeable(right):
         atoms: dict[int, Node] = {}
         vector_args: set[str] = set()
         counter = [0]
@@ -505,7 +581,7 @@ def _probe_truth(node: Node, base_eval: Callable[[Node], Any]) -> bool | None:
         if atoms:
             keys = {identity: _render(atom) for identity, atom in atoms.items()}
             rng = random.Random(0x5EED)
-            verdicts: list[bool] = []
+            pairs: list[tuple[Any, Any]] = []
             try:
                 for _ in range(_PROBE_SEEDS):
                     values: dict[str, Any] = {}
@@ -514,13 +590,14 @@ def _probe_truth(node: Node, base_eval: Callable[[Node], Any]) -> bool | None:
                             values[key] = _random_vector(rng) if key in vector_args else _random_scalar(rng)
                     assignment = {identity: values[keys[identity]] for identity in atoms}
                     budget = [_MAX_PROBE_NODES, time.monotonic() + _PROBE_TIME_BUDGET]
-                    probe = _probe_eval(node, assignment, base_eval, budget)
-                    if probe is UNKNOWN or not isinstance(probe, bool):
-                        verdicts = []
+                    left_value = _probe_eval(left, assignment, base_eval, budget)
+                    right_value = _probe_eval(right, assignment, base_eval, budget)
+                    if left_value is UNKNOWN or right_value is UNKNOWN:
+                        pairs = []
                         break
-                    verdicts.append(probe)
-                if verdicts and all(value == verdicts[0] for value in verdicts):
-                    result = verdicts[0]
+                    pairs.append((left_value, right_value))
+                if pairs:
+                    result = _decide(op, pairs)
             except _ProbeAbort:
                 result = None
             except (RecursionError, ArithmeticError, ValueError, TypeError, OverflowError):
@@ -573,6 +650,9 @@ def junk_truth(node: Node | None, base_eval: Callable[[Node], Any]) -> bool | No
     if verdict is not None:
         return verdict
     verdict = angle_gap_truth(node, base_eval)
+    if verdict is not None:
+        return verdict
+    verdict = _mod_shift_truth(node, base_eval)
     if verdict is not None:
         return verdict
     return _probe_truth(node, base_eval)

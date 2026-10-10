@@ -840,17 +840,8 @@ def remove_unused_locals(root: Node, analyzer: Analyzer, stats: PassStats) -> No
         if node.kind == "function":
             node.fields["body"] = process(node.get("body", []))
             return
-        for field in node.fields.values():
-            if isinstance(field, Node):
-                process_functions(field)
-            elif isinstance(field, (list, tuple)):
-                for item in field:
-                    if isinstance(item, Node):
-                        process_functions(item)
-                    elif isinstance(item, (list, tuple)):
-                        for nested in item:
-                            if isinstance(nested, Node):
-                                process_functions(nested)
+        for child in children(node):
+            process_functions(child)
 
     def process(statements: list[Node]) -> list[Node]:
         output: list[Node] = []
@@ -1012,17 +1003,8 @@ def memo_guard_bindings(root: Node, analyzer: Analyzer) -> set[int]:
                             return
                 external[binding.ident] = True
         chain.append(node)
-        for value in node.fields.values():
-            if isinstance(value, Node):
-                visit(value)
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    if isinstance(item, Node):
-                        visit(item)
-                    elif isinstance(item, (list, tuple)):
-                        for nested in item:
-                            if isinstance(nested, Node):
-                                visit(nested)
+        for child in children(node):
+            visit(child)
         chain.pop()
 
     visit(root)
@@ -1077,23 +1059,10 @@ def parent_map_of(root: Node) -> dict[int, Node]:
     result: dict[int, Node] = {}
 
     def visit(node: Node) -> None:
-        for value in node.fields.values():
-            if isinstance(value, Node):
-                if id(value) not in result:
-                    result[id(value)] = node
-                    visit(value)
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    if isinstance(item, Node):
-                        if id(item) not in result:
-                            result[id(item)] = node
-                            visit(item)
-                    elif isinstance(item, (list, tuple)):
-                        for nested in item:
-                            if isinstance(nested, Node):
-                                if id(nested) not in result:
-                                    result[id(nested)] = node
-                                    visit(nested)
+        for child in children(node):
+            if id(child) not in result:
+                result[id(child)] = node
+                visit(child)
 
     visit(root)
     return result
@@ -1206,17 +1175,8 @@ def remove_dead_pool_writes(root: Node, analyzer: Analyzer, stats: PassStats) ->
                         return
                     alive.add(root_id)
         chain.append(node)
-        for value in node.fields.values():
-            if isinstance(value, Node):
-                visit_names(value)
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    if isinstance(item, Node):
-                        visit_names(item)
-                    elif isinstance(item, (list, tuple)):
-                        for nested in item:
-                            if isinstance(nested, Node):
-                                visit_names(nested)
+        for child in children(node):
+            visit_names(child)
         chain.pop()
 
     visit_names(root)
@@ -1578,15 +1538,7 @@ class PoolResolver:
                 if current.kind == "function":
                     continue
                 self.top_level_ids.add(id(current))
-                for value in current.fields.values():
-                    if isinstance(value, Node):
-                        stack.append(value)
-                    elif isinstance(value, (list, tuple)):
-                        for item in value:
-                            if isinstance(item, Node):
-                                stack.append(item)
-                            elif isinstance(item, (list, tuple)):
-                                stack.extend(nested for nested in item if isinstance(nested, Node))
+                stack.extend(children(current))
         for statement, target, paired in write_sites:
             path_info = self.write_path(target)
             if path_info is None:
@@ -1658,20 +1610,9 @@ class PoolResolver:
                             self.safe = False
                             return False
             chain.append(node)
-            for value in node.fields.values():
-                if isinstance(value, Node):
-                    if not visit(value):
-                        return False
-                elif isinstance(value, (list, tuple)):
-                    for item in value:
-                        if isinstance(item, Node):
-                            if not visit(item):
-                                return False
-                        elif isinstance(item, (list, tuple)):
-                            for nested in item:
-                                if isinstance(nested, Node):
-                                    if not visit(nested):
-                                        return False
+            for child in children(node):
+                if not visit(child):
+                    return False
             chain.pop()
             return True
 
@@ -1689,17 +1630,8 @@ class PoolResolver:
             if id(node) in reads:
                 result[id(node)] = tuple(chain[:20])
             chain.append(node)
-            for value in node.fields.values():
-                if isinstance(value, Node):
-                    visit(value)
-                elif isinstance(value, (list, tuple)):
-                    for item in value:
-                        if isinstance(item, Node):
-                            visit(item)
-                        elif isinstance(item, (list, tuple)):
-                            for nested in item:
-                                if isinstance(nested, Node):
-                                    visit(nested)
+            for child in children(node):
+                visit(child)
             chain.pop()
 
         visit(self.root)
@@ -1708,17 +1640,8 @@ class PoolResolver:
     def parent_map(self) -> dict[int, Node]:
         result: dict[int, Node] = {}
         for node in walk(self.root):
-            for value in node.fields.values():
-                if isinstance(value, Node):
-                    result[id(value)] = node
-                elif isinstance(value, (list, tuple)):
-                    for item in value:
-                        if isinstance(item, Node):
-                            result[id(item)] = node
-                        elif isinstance(item, (list, tuple)):
-                            for nested in item:
-                                if isinstance(nested, Node):
-                                    result[id(nested)] = node
+            for child in children(node):
+                result[id(child)] = node
         return result
 
     def is_object_position(self, node: Node) -> bool:
@@ -2029,28 +1952,44 @@ class PoolResolver:
         self.build_local_values()
 
     def build_local_values(self) -> None:
-        declarations: list[Node] = []
+        """Constant values of locals, for decoder/argument evaluation.
+
+        Only unambiguous ones: `local x = <const>` never reassigned, or a
+        bare `local x` given exactly one straight-line top-level assignment
+        that every read follows. (Taking the last constant assignment in
+        source order folded multi-assigned registers into wrong constants.)"""
+        top_statements = {id(statement) for statement in self.root.get("body", [])}
+        first_read: dict[int, int] = {}
+        candidates: list[tuple[Node, Binding, Node]] = []
         for node in walk_unique(self.root):
-            if node.kind == "local" or (node.kind == "assign" and len(node.get("targets", [])) == 1 and len(node.get("values", [])) == 1):
-                declarations.append(node)
-        declarations.sort(key=lambda item: item.start)
-        for node in declarations:
-            if node.kind == "local":
+            if node.kind == "name":
+                if id(node) in self.targets:
+                    continue
+                binding = binding_for(self.analyzer, node)
+                if binding is not None:
+                    first_read[binding.ident] = min(first_read.get(binding.ident, node.start), node.start)
+            elif node.kind == "local":
                 bindings = self.analyzer.declaration_bindings.get(id(node), [])
                 values = node.get("values", [])
-                if len(bindings) != 1 or len(values) != 1:
-                    continue
-                binding = bindings[0]
-            else:
+                if len(bindings) == 1 and len(values) == 1 and bindings[0].writes == 0:
+                    candidates.append((node, bindings[0], values[0]))
+            elif node.kind == "assign" and len(node.get("targets", [])) == 1 and len(node.get("values", [])) == 1:
                 target = node.get("targets", [])[0]
-                if target.kind != "name":
+                if target.kind != "name" or id(node) not in top_statements:
                     continue
                 binding = binding_for(self.analyzer, target)
-                if binding is None:
+                if binding is None or binding.writes != 1:
                     continue
-                values = node.get("values", [])
+                declaration = binding.declaration
+                if not (isinstance(declaration, Node) and declaration.kind == "local" and not declaration.get("values")):
+                    continue
+                candidates.append((node, binding, node.get("values", [])[0]))
+        candidates.sort(key=lambda item: item[0].start)
+        for node, binding, value_node_ in candidates:
+            if node.kind == "assign" and first_read.get(binding.ident, node.end) < node.end:
+                continue
             try:
-                value = self.static_eval(values[0], None, 0)
+                value = self.static_eval(value_node_, None, 0)
             except (ArithmeticError, TypeError, ValueError, OverflowError):
                 continue
             if value is not UNKNOWN:

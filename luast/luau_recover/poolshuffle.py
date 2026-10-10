@@ -20,7 +20,7 @@ from __future__ import annotations
 from typing import Any
 
 from .analysis import Analyzer, Binding, binding_for
-from .model import Node, walk
+from .model import Node, children, walk
 
 
 def _index_slot(node: Node, binding: Binding, analyzer: Analyzer) -> int | None:
@@ -80,15 +80,7 @@ def _calls_or_reads(node: Node, pool: Binding, analyzer: Analyzer) -> bool:
             return True
         if current.kind == "name" and binding_for(analyzer, current) is pool:
             return True
-        for value in current.fields.values():
-            if isinstance(value, Node):
-                stack.append(value)
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    if isinstance(item, Node):
-                        stack.append(item)
-                    elif isinstance(item, (list, tuple)):
-                        stack.extend(nested for nested in item if isinstance(nested, Node))
+        stack.extend(children(current))
     return False
 
 

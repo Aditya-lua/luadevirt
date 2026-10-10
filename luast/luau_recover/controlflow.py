@@ -6,7 +6,7 @@ from typing import Any
 
 from .analysis import Analyzer, Binding, binding_for
 from .emitter import Emitter
-from .model import Node, clone_value, count_nodes, walk
+from .model import Node, children, clone_value, count_nodes, walk
 from .passes import UNKNOWN, bool_const, constant_environment, evaluate, is_number, is_int, numeric_result, truthy, builtin_call, value_node, is_phi, phi_apply, phi_binop, phi_from_leaves, unphi
 
 
@@ -301,17 +301,8 @@ class DispatcherPass:
         return None
 
     def node_children(self, node: Node) -> list[Node]:
-        result: list[Node] = []
-        for value in node.fields.values():
-            if isinstance(value, Node):
-                result.append(value)
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    if isinstance(item, Node):
-                        result.append(item)
-                    elif isinstance(item, (list, tuple)):
-                        result.extend(item for item in item if isinstance(item, Node))
-        return result
+        # children() also reaches `elifs` arm bodies ([(cond, [stmts])])
+        return list(children(node))
 
     def looks_like_dispatch(self, tree: list[Node], state: Binding) -> bool:
         found = False
@@ -723,14 +714,7 @@ class DispatcherPass:
             current = stack.pop()
             if current.kind == "name" and binding_for(self.analyzer, current) is state:
                 return True
-            for value in current.fields.values():
-                if isinstance(value, Node):
-                    stack.append(value)
-                elif isinstance(value, (list, tuple)):
-                    stack.extend(item for item in value if isinstance(item, Node))
-                    for item in value:
-                        if isinstance(item, (list, tuple)):
-                            stack.extend(nested for nested in item if isinstance(nested, Node))
+            stack.extend(children(current))
         return False
 
     def recover(self, dispatcher: Dispatcher) -> Node | None:
