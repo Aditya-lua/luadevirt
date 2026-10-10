@@ -1318,7 +1318,8 @@ def main(argv=None):
     ap.add_argument("--max-states", type=int, default=500)
     args = ap.parse_args(argv)
 
-    raw = open(args.input, "rb").read()
+    with open(args.input, "rb") as handle:
+        raw = handle.read()
     src = raw.decode("utf-8", "surrogateescape")
     root, errors, _ = parse(src)
     if errors:

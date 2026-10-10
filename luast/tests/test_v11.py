@@ -103,7 +103,9 @@ def pool_shuffle_program() -> str:
     )
 
 
-class V11Tests(unittest.TestCase):
+class BehaviourMixin:
+    """Recover a program and (when luau runs) compare printed output."""
+
     def parse(self, source):
         root, errors, _ = parse(source)
         self.assertEqual(errors, [])
@@ -126,6 +128,9 @@ class V11Tests(unittest.TestCase):
     def assert_same_behaviour(self, source: str, output: str) -> None:
         if HAVE_LUAU:
             self.assertEqual(self.run_luau(source), self.run_luau(output))
+
+
+class V11Tests(BehaviourMixin, unittest.TestCase):
 
     def test_compound_assignment_round_trips(self):
         source = "local x = 5\nx += 1\nlocal t = {n = 1}\nt.n ..= \"a\"\nprint(x, t.n)\n"
