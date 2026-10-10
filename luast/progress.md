@@ -91,3 +91,27 @@ Root causes found and fixed:
 
 Tests: `tests/test_v11.py` (7 cases, executed with the bundled `luau` when
 available and compared output-for-output).
+
+### 2026-10-10 (later) — soundness round 2, measured by behaviour diff
+Subset of 63 Ouroboros samples (12 v1.1.2, 11 v1.0.0, 40 random v1.0.1),
+behaviour-identical to the input in the fake Roblox env:
+**baseline 0/63 → 61/63**, mean 63.6 s → 20.1 s per file. The two
+remaining (`emvmz0`, `8va7jh`) were then fixed and match individually;
+the full set was not re-run after that.
+
+Further root causes fixed:
+9. Junk prober folded "false on random inputs" (operands correlated via
+   earlier statements, e.g. Lagrange identity) — now only input-invariant
+   verdicts; exact `X%n == (X+d)%n` rule.
+10. `build_local_values` let the last constant assignment stand in for
+    every read of a multi-assigned local (decoder arguments).
+11. Walkers skipped `elseif` arm bodies (pool liveness, escape check,
+    parent maps, memo guards, state detection) → `model.children()`.
+12. Recorded branch facts were literal true/false → `Truthiness` markers;
+    repeated env conflicts now reprocess with no knowledge.
+13. State if-expressions: runtime-valued arms were dropped as junk and the
+    dead `else` taken; now bail / skip dead arms.
+
+Pending: `squirrelescape.luau` (zip sample) still differs — phase not yet
+bisected. Full 333-file corpus run not completed.
+Peak RSS on the 3.2 MB sample unchanged (~576 MB).

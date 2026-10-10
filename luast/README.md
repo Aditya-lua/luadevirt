@@ -1,20 +1,69 @@
 # LUAST Deobfuscator
 
-Deobfuscator for LUAST v1.0.1 obfuscated Roblox Luau scripts, including
-**level-3** (state-machine + encrypted payload) support via a static Luau
-emulator (`luau_recover/lua_rt.py` + `luau_recover/luast_l3.py`).
+Deobfuscator for LUAST-obfuscated Roblox Luau scripts — **v1.0.0, v1.0.1 and
+v1.1.x** — including **level-3** (state-machine + encrypted payload) support
+via a static Luau emulator (`luau_recover/lua_rt.py` + `luau_recover/luast_l3.py`).
+Output is checked for *behaviour*, not just syntax: a differential harness runs
+input and output side by side in a fake Roblox environment.
 
 ## Features
 
-- Full LUAST v1.0.1 control-flow recovery: flattened dispatcher reconstruction,
-  opaque-predicate resolution, junk/dead-code elimination, pool cleanup
+- Full LUAST v1.0.x / v1.1.x control-flow recovery: flattened dispatcher
+  reconstruction (structured `if`/`while` with join points), opaque-predicate
+  resolution, junk/dead-code elimination, pool cleanup
 - Level-3 support: statically executes the obfuscated state machine
   (pool permutation, xxHash-style avalanche + LCG keystream payload decoder)
   and recovers the original payload — including a constrained seed-recovery
   solver when Roblox-shim drift affects runtime accumulators
 - Live fetch mode: pulls scripts straight from the Ouroboros raw GitHub repo
 - Optional syntax/VM validation against the real Luau binaries
+- Differential behaviour check (`scripts/behaviour_diff.py`): original vs
+  output in the bundled fake Roblox environment, trace for trace
 
+
+## What's New (v1.2) — LUAST v1.1.x and behaviour-exact output
+
+Validated on the LUAST samples in
+[`joustingmatch/Ouroboros/games`](https://github.com/joustingmatch/Ouroboros/tree/main/games)
+(310 × v1.0.1, 11 × v1.0.0, 12 × v1.1.2) by running every input and its
+output in the fake Roblox environment and comparing the recorded behaviour.
+See [`progress.md`](progress.md) for the numbers and root-cause notes.
+
+**v1.1.x support**
+- **Compound assignment** (`s += K`, `x ..= y`) — desugared in the parser so
+  every pass sees `x = x op e`; `s += K` dispatchers are recognised.
+- **Runtime pool shuffle** — v1.1 permutes the constant pool in the first
+  state of the main dispatcher; the permutation is applied statically (only
+  when provably first) before constants are resolved.
+- **Hashed string compares** — inlined djb2-xor closures
+  `(function(f,e,g,c) ... return f==c end)(x, #lit, hash, lit)` fold to
+  `x == lit`; decoys with mismatched constants fold to `false`.
+
+**Control-flow recovery**
+- Statements that run before a branch are emitted before it (flags were
+  tested before being computed).
+- Post-dominator join points: if/else diamonds are emitted once instead of
+  duplicating every successor (main bodies no longer hit the emit budget).
+- Branch facts are truthiness-only, environment merges are sound, state
+  if-expressions with runtime values are kept.
+
+**Correctness fixes in the shared passes** (all found by behaviour diffing;
+the previous release produced output that behaved differently from its input
+on every sampled script)
+- Pool slots rewritten in loops/branches/functions (v1.0.1 register tables,
+  dispatcher state in `t[k]`) are no longer resolved as constants.
+- Opaque-predicate prober: identities compare the *same* variables on both
+  sides, `vector*vector` is component-wise, only input-invariant verdicts
+  fold (correlated operands are left alone), exact `X%n == (X+d)%n` rule,
+  inverted `gsub`-doubling verdict fixed.
+- `local function` parameters are renamed consistently; `elseif` bodies are
+  visited by liveness/escape analyses; pool declarations stay while reads
+  remain; decoder arguments use only unambiguous local values.
+- Deterministic output (analyses no longer key on recycled `id()`s).
+
+**L3** results are only accepted when the payload came through the keystream
+decoder; anything else falls back to the generic pipeline instead of emitting
+a guessed `print(...)`.
 
 ## What's New (v1.1)
 
@@ -59,18 +108,33 @@ python -m luau_recover.batch --help
 
 # run the regression tests
 python tests/test_recovery.py
+python tests/test_junk_phi.py
+python tests/test_v11.py        # behaviour-checked with the bundled luau
+python tests/test_soundness.py
+
+# compare behaviour of an input and its output (fake Roblox environment)
+python scripts/behaviour_diff.py original.lua out.luau
+python scripts/behaviour_diff.py --pairs IN_DIR OUT_DIR --report diff.jsonl
+
+# bisect which pipeline phase changes behaviour
+LUAST_MAX_PHASES=6 python deobfuscate.py in.lua -o out.luau
 ```
 
 Inputs with a luast level-3 header are auto-routed to the L3 static
-emulator (status `ok-l3`); regular LUAST v1.0.1 scripts go through the
-parser/control-flow/pipeline recovery passes. If no `-o` is given, results
+emulator (status `ok-l3`) when using `deobfuscate.py`; if it cannot recover a
+decoder-verified payload the file falls back to the parser/control-flow/
+pipeline recovery passes, which handle regular LUAST v1.0.x and v1.1.x
+scripts (`luau_recover.batch` always uses the pipeline). If no `-o` is given, results
 are written next to the input / into `DEOBFUSCATED/`.
 
 ## Layout
 
 - `deobfuscate.py` — CLI entry point
 - `luau_recover/` — parser, control-flow recovery, cleanup passes, L3 emulator, CLI
-- `tests/` — regression tests
+- `tests/` — regression tests (`test_v11.py` / `test_soundness.py` execute
+  input and output with the bundled `luau` and compare their output)
+- `scripts/behaviour_diff.py` — differential behaviour check
+- `progress.md` — project memory (goals, decisions, change log)
 
 ## Validation (optional)
 

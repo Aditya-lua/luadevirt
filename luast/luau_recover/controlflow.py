@@ -843,9 +843,9 @@ class DispatcherPass:
         visited = {EXIT}
         stack = [(EXIT, iter(preds[EXIT]))]
         while stack:
-            node, children = stack[-1]
+            node, pending_preds = stack[-1]
             advanced = False
-            for child in children:
+            for child in pending_preds:
                 if child not in visited:
                     visited.add(child)
                     stack.append((child, iter(preds[child])))
