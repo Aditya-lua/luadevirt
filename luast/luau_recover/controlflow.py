@@ -652,18 +652,16 @@ class DispatcherPass:
         return paths
 
     def expand_state_ifexpr(self, expression: Node, statements: list[Node], index: int, state: Binding, value: int | float, conditions: list[tuple[Node, bool, int]], actions: list[Node], env: dict[int, Any], depth: int) -> list[DispatchPath]:
-        branches: list[tuple[Node | None, Node, list[tuple[Node, bool, int]]]] = []
-        prior: list[tuple[Node, bool, int]] = []
+        """`state = if c1 then v1 elseif c2 then v2 else v3`: one path per
+        reachable arm. Arms after one that is known to be taken are dead;
+        a path carries only the conditions that are still undecided."""
         offset = len(actions)
-        first_condition = expression.get("cond")
-        branches.append((first_condition, expression.get("then"), prior + [(first_condition, True, offset)]))
-        prior = prior + [(first_condition, False, offset)]
-        for branch_condition, branch_value in expression.get("elifs", []):
-            branches.append((branch_condition, branch_value, prior + [(branch_condition, True, offset)]))
-            prior = prior + [(branch_condition, False, offset)]
-        branches.append((None, expression.get("else_"), list(prior)))
+        arms: list[tuple[Node | None, Node | None]] = [(expression.get("cond"), expression.get("then"))]
+        arms += [(branch_condition, branch_value) for branch_condition, branch_value in expression.get("elifs", [])]
+        arms.append((None, expression.get("else_")))
         result: list[DispatchPath] = []
-        for condition, leaf, branch_conditions in branches:
+        undecided: list[tuple[Node, bool, int]] = []
+        for condition, leaf in arms:
             if condition is None:
                 selected: bool | None = True
             else:
@@ -673,8 +671,9 @@ class DispatcherPass:
                     selected = None
             if selected is False:
                 continue
+            arm_conditions = list(undecided) + ([(condition, True, offset)] if selected is None else [])
             branch_env = dict(env)
-            for branch_condition, taken, _ in branch_conditions:
+            for branch_condition, taken, _ in arm_conditions:
                 self.record_condition_value(branch_condition, taken, branch_env, state)
             if leaf is None:
                 # `state = if c then v` with a false condition leaves the
@@ -682,12 +681,21 @@ class DispatcherPass:
                 leaf_value = value
             else:
                 leaf_eval = self.eval_data(leaf, state, value, branch_env)
-                if leaf_eval is UNKNOWN or not is_number(leaf_eval):
-                    # Non-number leaf: junk transition, drop this branch.
+                if leaf_eval is UNKNOWN or is_phi(leaf_eval) or isinstance(leaf_eval, Truthiness):
+                    # a runtime value (e.g. a pool slot), not a junk arm
+                    raise DispatcherBail("dynamic state value")
+                if not is_number(leaf_eval):
+                    # known non-number sentinel: the dispatch cannot go on
+                    result.append(DispatchPath(list(conditions) + arm_conditions, list(actions), ("dead",), branch_env))
+                    if selected is True:
+                        break
+                    undecided.append((condition, False, offset))
                     continue
                 leaf_value = leaf_eval
-            branch_path = list(conditions) + (branch_conditions if selected is None else [])
-            result.extend(self.execute(statements[index + 1:], state, leaf_value, branch_path, list(actions), depth + 1, branch_env))
+            result.extend(self.execute(statements[index + 1:], state, leaf_value, list(conditions) + arm_conditions, list(actions), depth + 1, branch_env))
+            if selected is True:
+                break
+            undecided.append((condition, False, offset))
         return result
 
     def else_chain(self, statement: Node) -> list[Node]:

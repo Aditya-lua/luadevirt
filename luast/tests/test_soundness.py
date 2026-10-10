@@ -89,6 +89,33 @@ class BehaviourTests(BehaviourMixin, unittest.TestCase):
         self.assertIn("bit32.bxor", output)
         self.assert_same_behaviour(source, output)
 
+    def test_state_ifexpr_with_runtime_leaf_is_kept(self):
+        # `s = if true then <runtime value> else 6`: the runtime arm was
+        # dropped as "junk" and the dead `else` arm taken instead
+        source = (
+            "local function nxt() return 3 end\n"
+            "local function run()\n"
+            "  local s, n = nil, 0\n"
+            "  s = 8\n"
+            "  while true do\n"
+            "    if s < 4 then\n"
+            "      if s < 2 then\n"
+            "        if s < 1 then s = if n < 3 then 7 else 5\n"
+            "        else s = if true then nxt() else 6 end\n"
+            "      elseif s < 3 then s = 1\n"
+            "      else n += 1; print(\"tick\", n); s = 0 end\n"
+            "    elseif s < 6 then\n"
+            "      if s < 5 then break else print(\"done\"); s = 4 end\n"
+            "    elseif s < 7 then s = 4\n"
+            "    elseif s < 8 then print(\"seven\"); s = 2\n"
+            "    else print(\"start\"); s = 1 end\n"
+            "  end\n"
+            "end\n"
+            "run()\n"
+        )
+        output = self.recover(source)
+        self.assert_same_behaviour(source, output)
+
     def test_output_is_deterministic(self):
         source = COMPOUND_DISPATCHER
         first, _ = Pipeline().run(source)
