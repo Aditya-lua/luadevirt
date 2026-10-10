@@ -13,6 +13,7 @@ from .emitter import emit
 from .lexer import lex
 from .model import Node, count_nodes, walk
 from .parser import parse
+from .poolshuffle import apply_pool_shuffle
 from .passes import (
     PassStats,
     PoolResolver,
@@ -83,6 +84,7 @@ class Pipeline:
 
         phases: list[tuple[str, Callable[[Node, Any, PassStats, str], None], bool]] = [
             ("aliases", self.phase_aliases, True),
+            ("pool-shuffle", self.phase_pool_shuffle, aggressive),
             ("pool", self.phase_pool, aggressive),
             ("fold", self.phase_fold, True),
             ("propagate", self.phase_propagate, True),
@@ -114,7 +116,13 @@ class Pipeline:
                 print(f"[mem] {label:20} maxRSS={mb}MB", file=_sys.stderr, flush=True)
 
         _memmark("pipeline start")
+        # debugging aid: LUAST_MAX_PHASES=n runs only the first n phases
+        # (bisect which pass changes a script's behaviour)
+        phase_limit = _os.environ.get("LUAST_MAX_PHASES")
+        if phase_limit and phase_limit.isdigit():
+            phases = phases[:int(phase_limit)]
         for phase_name, phase, enabled in phases:
+            clear_verdict_cache()  # holds node references; per phase only
             if not enabled:
                 report.history.append({"name": phase_name, "status": "skipped"})
                 continue
@@ -259,6 +267,10 @@ class Pipeline:
 
     def phase_aliases(self, root: Node, analyzer: Any, stats: PassStats, source: str) -> None:
         restore_library_aliases(root, analyzer, stats)
+
+    def phase_pool_shuffle(self, root: Node, analyzer: Any, stats: PassStats, source: str) -> None:
+        if apply_pool_shuffle(root, analyzer, stats):
+            stats.pool_shuffles += 1
 
     def phase_pool(self, root: Node, analyzer: Any, stats: PassStats, source: str) -> None:
         resolver = PoolResolver(root, analyzer, source, allow_escape=True)

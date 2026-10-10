@@ -43,11 +43,15 @@ class Vector3:
         return Vector3(self.x - other.x, self.y - other.y, self.z - other.z)
 
     def __mul__(self, other):
+        # Luau `vector * vector` is component-wise (not a dot product)
         if isinstance(other, Vector3):
-            return self.x * other.x + self.y * other.y + self.z * other.z
+            return Vector3(self.x * other.x, self.y * other.y, self.z * other.z)
         return Vector3(self.x * other, self.y * other, self.z * other)
 
     __rmul__ = __mul__
+
+    def dot(self, other):
+        return self.x * other.x + self.y * other.y + self.z * other.z
 
 
 def _random_vector(rng: random.Random) -> Vector3:
@@ -67,7 +71,7 @@ def vector_call(name: str | None, args: list[Any]) -> Any:
     if len(args) >= 2 and isinstance(args[0], Vector3) and isinstance(args[1], Vector3):
         a, b = args[0], args[1]
         if name == "vector.dot":
-            return a * b
+            return a.dot(b)
         if name == "vector.cross":
             return Vector3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x)
     if len(args) >= 1 and isinstance(args[0], Vector3):
@@ -81,11 +85,11 @@ def vector_call(name: str | None, args: list[Any]) -> Any:
         if name == "vector.angle":
             u = Vector3(a.x - b.x, a.y - b.y, a.z - b.z)
             v = Vector3(c.x - b.x, c.y - b.y, c.z - b.z)
-            uu = u * u
-            vv = v * v
+            uu = u.dot(u)
+            vv = v.dot(v)
             if uu == 0 or vv == 0:
                 return 0.0
-            cosine = max(-1.0, min(1.0, (u * v) / math.sqrt(uu * vv)))
+            cosine = max(-1.0, min(1.0, u.dot(v) / math.sqrt(uu * vv)))
             return math.acos(cosine)
     return UNKNOWN
 
@@ -110,10 +114,16 @@ def _vector_arith(op: str, left: Any, right: Any) -> Any:
     return UNKNOWN
 
 
-def _collect_vector_atoms(node: Node | None, atoms: dict[int, Node], counter: list[int], vector_args: set[int] | None = None) -> None:
-    """Collect probe targets: vector operands, unknown names, and string
+def _collect_vector_atoms(node: Node | None, atoms: dict[int, Node], counter: list[int], vector_args: set[str] | None = None) -> None:
+    """Collect probe targets: leaf operands (names, index chains) and string
     constants that appear inside arithmetic (junk states compute with
-    pooled strings; they are never really strings there)."""
+    pooled strings; they are never really strings there).
+
+    Atoms are leaves only; compound vector arguments are evaluated, never
+    replaced. `vector_args` collects the rendered keys of leaves used
+    directly as vector operands; the prober gives every occurrence of the
+    same key the same value (an identity compares the same variables on
+    both sides)."""
     if vector_args is None:
         vector_args = set()
     if node is None or counter[0] > _MAX_PROBE_NODES:
@@ -125,10 +135,14 @@ def _collect_vector_atoms(node: Node | None, atoms: dict[int, Node], counter: li
         name = _dotted(func)
         if name and name.startswith("vector."):
             for arg in node.get("args", []):
-                if isinstance(arg, Node) and arg.kind not in {"number", "bool", "nil"}:
-                    atoms.setdefault(id(arg), arg)
-                    vector_args.add(id(arg))
-                    _collect_vector_atoms(arg, atoms, counter, vector_args)
+                leaf = _strip(arg) if isinstance(arg, Node) else None
+                if not isinstance(leaf, Node) or leaf.kind in {"number", "bool", "nil", "string"}:
+                    continue
+                if leaf.kind in {"name", "index", "indexname"}:
+                    atoms.setdefault(id(leaf), leaf)
+                    vector_args.add(_render(leaf))
+                else:
+                    _collect_vector_atoms(leaf, atoms, counter, vector_args)
             return
         if name and (name.startswith("math.") or name in {"tonumber", "tostring"}):
             for arg in node.get("args", []):
@@ -250,7 +264,8 @@ def _probe_eval(node: Node | None, assignment: dict[int, Any], base_eval: Callab
                 if op == "/":
                     return left / right
                 if op == "%":
-                    return math.fmod(left, right)
+                    # Lua floor-modulo (Python %), not C fmod
+                    return left % right
                 if op == "^":
                     return left ** right
                 return UNKNOWN
@@ -344,11 +359,15 @@ def _string_doubling_truth(node: Node) -> bool | None:
     stripped = text.replace("%1", "").replace("%2", "").replace("%0", "")
     if "%" in stripped or len(text) <= 1:
         return None
+    # The rewritten string is strictly longer than the (non-empty) subject,
+    # so `len(s) >= len(doubled)` is false and `len(s) < len(doubled)` true
+    # (checked against Luau: ("hello"):len() >= ("hello"):gsub("(.)",
+    # "%1%1", 1):len() --> false).
     op = node.get("op")
-    if op == ">=":
-        return True
-    if op == "<":
+    if op in {">=", ">"}:
         return False
+    if op in {"<", "<="}:
+        return True
     return None
 
 
@@ -442,7 +461,8 @@ def _angle_abs(node: Node | None) -> Node | None:
     return inner
 
 
-_verdict_cache: dict[int, bool | None] = {}
+# id(node) -> (node, verdict); the node is kept so a recycled id is detected
+_verdict_cache: dict[int, tuple[Node, bool | None]] = {}
 
 
 def clear_verdict_cache() -> None:
@@ -472,25 +492,27 @@ def _is_probeable(node: Node | None) -> bool:
 def _probe_truth(node: Node, base_eval: Callable[[Node], Any]) -> bool | None:
     """Random-probe a predicate: fold only when truth is input-invariant."""
     cached = _verdict_cache.get(id(node))
-    if cached is not None or id(node) in _verdict_cache:
-        return cached
+    if cached is not None and cached[0] is node:
+        return cached[1]
     result: bool | None = None
     left = _strip(node.get("left"))
     right = _strip(node.get("right"))
     if _is_probeable(left) and _is_probeable(right):
         atoms: dict[int, Node] = {}
-        vector_args: set[int] = set()
+        vector_args: set[str] = set()
         counter = [0]
         _collect_vector_atoms(node, atoms, counter, vector_args)
         if atoms:
+            keys = {identity: _render(atom) for identity, atom in atoms.items()}
             rng = random.Random(0x5EED)
             verdicts: list[bool] = []
             try:
                 for _ in range(_PROBE_SEEDS):
-                    assignment = {
-                        identity: (_random_vector(rng) if identity in vector_args else _random_scalar(rng))
-                        for identity in atoms
-                    }
+                    values: dict[str, Any] = {}
+                    for key in keys.values():
+                        if key not in values:
+                            values[key] = _random_vector(rng) if key in vector_args else _random_scalar(rng)
+                    assignment = {identity: values[keys[identity]] for identity in atoms}
                     budget = [_MAX_PROBE_NODES, time.monotonic() + _PROBE_TIME_BUDGET]
                     probe = _probe_eval(node, assignment, base_eval, budget)
                     if probe is UNKNOWN or not isinstance(probe, bool):
@@ -503,7 +525,7 @@ def _probe_truth(node: Node, base_eval: Callable[[Node], Any]) -> bool | None:
                 result = None
             except (RecursionError, ArithmeticError, ValueError, TypeError, OverflowError):
                 result = None
-    _verdict_cache[id(node)] = result
+    _verdict_cache[id(node)] = (node, result)
     return result
 
 

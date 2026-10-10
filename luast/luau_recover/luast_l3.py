@@ -17,6 +17,7 @@ import argparse
 import math
 import os
 import sys
+import time
 
 from . import lua_rt as _luart
 from .lua_rt import (  # noqa: E402
@@ -47,6 +48,8 @@ def _rbs_known_type(v):
 
 MAX_LOOP_ITERS = 200000
 MAX_TOTAL_STEPS = 2000000
+DEADLINE_SECONDS = float(os.environ.get("LUAST_L3_SECONDS", "90"))
+_DEADLINE = None
 
 
 class Env:
@@ -362,6 +365,9 @@ class Interp:
         self.steps += 1
         if self.steps > MAX_TOTAL_STEPS:
             raise LuaError("emulation step limit exceeded")
+        if _DEADLINE is not None and (self.steps & 8191) == 0 \
+                and time.monotonic() > _DEADLINE:
+            raise LuaError("emulation time budget exceeded")
         k = e.kind
         if k == "paren":
             return self.eval(e.get("expr"), env)
@@ -1304,6 +1310,7 @@ def _trial_run(interp, root, states, ztrace):
 
 
 def main(argv=None):
+    global _DEADLINE
     ap = argparse.ArgumentParser()
     ap.add_argument("input")
     ap.add_argument("-o", "--output")
@@ -1324,6 +1331,7 @@ def main(argv=None):
         return 2
 
     interp = Interp()
+    _DEADLINE = time.monotonic() + DEADLINE_SECONDS
     interp.set_source(src)
     register_string_table(interp.globals_env.vars)
     interp.z_var_name = find_z_var_name(root, d)
@@ -1447,6 +1455,17 @@ def main(argv=None):
 
     # ---------------- seed-recovery fallback ----------------
     final_payloads = list(interp.outputs)
+    # A result is only trusted when the emulated payload is clean printable
+    # text, or the seed solver's self-check agrees with the observed round
+    # call / tracked Z accumulator. Anything else (no payload, a diverged dispatcher, a solver guess)
+    # means this is not an L3 build we understand: report non-zero so the
+    # caller falls back to the generic pipeline instead of emitting garbage.
+    # An L3 payload is always produced by the buffer keystream decoder;
+    # plain scripts that merely print text are not L3 results.
+    decoded = bool(interp.obs_fromstring and interp.obs_readstring)
+    trusted = decoded and bool(interp.outputs) and err is None and all(
+        all(32 <= b < 127 or b in (9, 10, 13) for b in line)
+        for line in interp.outputs)
     if interp.obs_fromstring and interp.obs_readstring:
         cipher = interp.obs_fromstring[-1]
         _, apn = interp.obs_readstring[-1]
@@ -1469,8 +1488,10 @@ def main(argv=None):
                 aa_native, _ = make_round(round_steps)
                 obs_arg, obs_ret = interp.obs_round_calls[-1][1], interp.obs_round_calls[-1][2]
                 ak_shim = (ae_state + _zfinal(interp)) % 4294967296
-                if interp.obs_round_calls and abs(aa_native(obs_arg) - obs_ret) < 0.5 \
-                        and abs(obs_arg - ak_shim) < 0.5:
+                seed_consistent = bool(interp.obs_round_calls) \
+                    and abs(aa_native(obs_arg) - obs_ret) < 0.5 \
+                    and abs(obs_arg - ak_shim) < 0.5
+                if seed_consistent:
                     pass  # pattern + seed derivation consistent
                 else:
                     print("[seed-recovery] warning: native round fn / seed "
@@ -1492,6 +1513,9 @@ def main(argv=None):
                               "drift = %d — Roblox shim semantics differ)"
                               % (z_true, z_shim, z_true - z_shim))
                     final_payloads = [c[0] for c in cands]
+                    # the solver is only meaningful when the dispatcher's Z
+                    # accumulator was actually tracked during emulation
+                    trusted = seed_consistent or any(z != "nil" for _, z in ztrace)
                     rep.append("== seed recovery ==")
                     rep.append("shim payload was: %r" % (interp.outputs or []))
                     rep.append("aq0 = %d" % aq0)
@@ -1506,6 +1530,11 @@ def main(argv=None):
     if args.report:
         open(args.report, "w").write("\n".join(rep) + "\n")
         print("\nreport -> %s" % args.report)
+
+    if not trusted:
+        print("\nno trustworthy L3 payload recovered (not an L3 build this "
+              "emulator understands)")
+        return 3
 
     # ---------------- recovered program ----------------
     out_path = args.output

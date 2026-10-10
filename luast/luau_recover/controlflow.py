@@ -10,6 +10,9 @@ from .model import Node, clone_value, count_nodes, walk
 from .passes import UNKNOWN, bool_const, constant_environment, evaluate, is_number, is_int, numeric_result, truthy, builtin_call, value_node, is_phi, phi_apply, phi_binop, phi_from_leaves, unphi
 
 
+EXIT = ("exit", None)  # virtual sink for post-dominators (break/return/dead)
+
+
 class StateSubstitutionError(Exception):
     pass
 
@@ -30,10 +33,13 @@ def _junk_truth(node: Node | None, base_eval) -> bool | None:
 
 @dataclass
 class DispatchPath:
-    conditions: list[tuple[Node, bool]]
+    # (condition, taken, len(actions) at the fork): the offset marks which
+    # actions ran before the branch so the emitter hoists them above it
+    conditions: list[tuple[Node, bool, int]]
     actions: list[Node]
     outcome: tuple[Any, ...]
     env: dict[int, Any] = field(default_factory=dict)
+    consumed: int = 0
 
 
 @dataclass
@@ -71,13 +77,16 @@ class DispatcherPass:
         # emit (shared successors re-emitted per predecessor), so the final
         # tree can dwarf the graph itself. Bail oversized dispatchers.
         self.max_emit_nodes = 150000
+        # emission recursion depth (one level per state on a path); joins
+        # make long straight-line bodies chain through emit_state
+        self.max_emit_depth = 2500
         self.work = 0
         self.base_env = constant_environment(analyzer)
         self.bailed: set[int] = set()
 
     def apply(self, rounds: int = 8) -> int:
         completed = 0
-        sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
+        sys.setrecursionlimit(max(sys.getrecursionlimit(), 60000))
         for _ in range(rounds):
             changed = False
             lists = self.statement_lists(self.root)
@@ -240,6 +249,14 @@ class DispatcherPass:
                 return ("complement", left.get("value"))
             if self.is_state(left, state) and self.is_number_node(right):
                 return ("negate", right.get("value"))
+        if expression.kind == "binop" and expression.get("op") == "+":
+            # v1.1 `s += K` (desugared by the parser to `s = s + K`)
+            left = expression.get("left")
+            right = expression.get("right")
+            if self.is_state(left, state) and self.is_number_node(right):
+                return ("add", right.get("value"))
+            if self.is_state(right, state) and self.is_number_node(left):
+                return ("add", left.get("value"))
         if expression.kind == "call":
             name = self.dotted_name(expression.get("func"))
             args = expression.get("args", [])
@@ -315,6 +332,8 @@ class DispatcherPass:
             return constant - value
         if kind == "negate":
             return value - constant
+        if kind == "add":
+            return value + constant
         return int(constant) ^ int(value)
 
     def eval_data(self, node: Node | None, state: Binding, value: int | float, env: dict[int, Any]) -> Any:
@@ -485,11 +504,13 @@ class DispatcherPass:
                 if binding is not None and (state is None or binding is not state):
                     env[binding.ident] = not value
 
-    def execute(self, statements: list[Node], state: Binding, value: int | float, conditions: list[tuple[Node, bool]], actions: list[Node], depth: int = 0, env: dict[int, Any] | None = None) -> list[DispatchPath]:
+    def execute(self, statements: list[Node], state: Binding, value: int | float, conditions: list[tuple[Node, bool, int]], actions: list[Node], depth: int = 0, env: dict[int, Any] | None = None) -> list[DispatchPath]:
         self.work += 1
         if self.work > self.max_work:
             raise DispatcherBail("work limit")
-        if depth > 100:
+        # flat `elseif` chains recurse once per arm (luast itself emits
+        # balanced trees, but hand-shaped dispatchers can be long)
+        if depth > 400:
             raise DispatcherBail("dispatcher nesting limit")
         paths: list[DispatchPath] = []
         current_value = value
@@ -627,15 +648,16 @@ class DispatcherPass:
         paths.append(DispatchPath(current_conditions, current_actions, ("edge", current_value), dict(current_env)))
         return paths
 
-    def expand_state_ifexpr(self, expression: Node, statements: list[Node], index: int, state: Binding, value: int | float, conditions: list[tuple[Node, bool]], actions: list[Node], env: dict[int, Any], depth: int) -> list[DispatchPath]:
-        branches: list[tuple[Node | None, Node, list[tuple[Node, bool]]]] = []
-        prior: list[tuple[Node, bool]] = []
+    def expand_state_ifexpr(self, expression: Node, statements: list[Node], index: int, state: Binding, value: int | float, conditions: list[tuple[Node, bool, int]], actions: list[Node], env: dict[int, Any], depth: int) -> list[DispatchPath]:
+        branches: list[tuple[Node | None, Node, list[tuple[Node, bool, int]]]] = []
+        prior: list[tuple[Node, bool, int]] = []
+        offset = len(actions)
         first_condition = expression.get("cond")
-        branches.append((first_condition, expression.get("then"), prior + [(first_condition, True)]))
-        prior = prior + [(first_condition, False)]
+        branches.append((first_condition, expression.get("then"), prior + [(first_condition, True, offset)]))
+        prior = prior + [(first_condition, False, offset)]
         for branch_condition, branch_value in expression.get("elifs", []):
-            branches.append((branch_condition, branch_value, prior + [(branch_condition, True)]))
-            prior = prior + [(branch_condition, False)]
+            branches.append((branch_condition, branch_value, prior + [(branch_condition, True, offset)]))
+            prior = prior + [(branch_condition, False, offset)]
         branches.append((None, expression.get("else_"), list(prior)))
         result: list[DispatchPath] = []
         for condition, leaf, branch_conditions in branches:
@@ -649,8 +671,8 @@ class DispatcherPass:
             if selected is False:
                 continue
             branch_env = dict(env)
-            if condition is not None:
-                self.record_condition_value(condition, True, branch_env, state)
+            for branch_condition, taken, _ in branch_conditions:
+                self.record_condition_value(branch_condition, taken, branch_env, state)
             if leaf is None:
                 # `state = if c then v` with a false condition leaves the
                 # state unchanged; treat it as an edge to the same state.
@@ -672,24 +694,25 @@ class DispatcherPass:
         nested = Node("if", condition.start, condition.end, cond=condition, then=body, elifs=statement.get("elifs", [])[1:], else_=statement.get("else_", []))
         return [nested]
 
-    def fork_if(self, statement: Node, state: Binding, value: int | float, conditions: list[tuple[Node, bool]], actions: list[Node], depth: int, env: dict[int, Any] | None = None) -> list[DispatchPath]:
+    def fork_if(self, statement: Node, state: Binding, value: int | float, conditions: list[tuple[Node, bool, int]], actions: list[Node], depth: int, env: dict[int, Any] | None = None) -> list[DispatchPath]:
         condition = statement.get("cond")
+        offset = len(actions)
         branch_env = dict(env or {})
         result: list[DispatchPath] = []
         then_env = dict(branch_env)
         self.record_condition_value(condition, True, then_env, state)
-        result.extend(self.execute(statement.get("then", []), state, value, conditions + [(condition, True)], list(actions), depth + 1, then_env))
+        result.extend(self.execute(statement.get("then", []), state, value, conditions + [(condition, True, offset)], list(actions), depth + 1, then_env))
         current = list(statement.get("elifs", []))
         prior = condition
         for branch_condition, branch_body in current:
             elif_env = dict(branch_env)
             self.record_condition_value(prior, False, elif_env, state)
             self.record_condition_value(branch_condition, True, elif_env, state)
-            result.extend(self.execute(branch_body, state, value, conditions + [(prior, False), (branch_condition, True)], list(actions), depth + 1, elif_env))
+            result.extend(self.execute(branch_body, state, value, conditions + [(prior, False, offset), (branch_condition, True, offset)], list(actions), depth + 1, elif_env))
             prior = branch_condition
         else_env = dict(branch_env)
         self.record_condition_value(prior, False, else_env, state)
-        result.extend(self.execute(statement.get("else_", []), state, value, conditions + [(prior, False)], list(actions), depth + 1, else_env))
+        result.extend(self.execute(statement.get("else_", []), state, value, conditions + [(prior, False, offset)], list(actions), depth + 1, else_env))
         return result
 
     def contains_state(self, node: Node | None, state: Binding) -> bool:
@@ -764,6 +787,8 @@ class DispatcherPass:
         self.stats.dispatchers_found += 1
         self.stats.states_recovered += len(graph)
         statements: list[Node] | None = None
+        self.ipdom = self.post_dominators(graph)
+        self.loop_nodes = {}
         try:
             statements = self.emit_state(initial, graph, set(), 0)
         except CycleHit:
@@ -783,10 +808,123 @@ class DispatcherPass:
             value = int(value)
         return (type(value).__name__, value)
 
-    def emit_state(self, value: int | float, graph: dict[Any, list[DispatchPath]], stack: set[Any], depth: int, loop_header: Any | None = None, in_loop: bool = False) -> list[Node] | None:
-        if depth > self.max_paths:
+    def successors(self, paths: list[DispatchPath], graph: dict[Any, list[DispatchPath]]) -> set[Any]:
+        result: set[Any] = set()
+        for path in paths:
+            if path.outcome[0] == "edge":
+                target = self.key(path.outcome[1])
+                result.add(target if target in graph else EXIT)
+            else:
+                result.add(EXIT)
+        return result
+
+    def post_dominators(self, graph: dict[Any, list[DispatchPath]]) -> dict[Any, Any]:
+        """Immediate post-dominator of every state (Cooper-Harvey-Kennedy
+        on the reversed state graph, rooted at a virtual EXIT). States that
+        cannot reach EXIT (infinite loops) get no entry."""
+        succ = {key: self.successors(paths, graph) for key, paths in graph.items()}
+        preds: dict[Any, list[Any]] = {EXIT: []}
+        for key in graph:
+            preds.setdefault(key, [])
+        for key, targets in succ.items():
+            for target in targets:
+                preds[target].append(key)
+        order: list[Any] = []
+        visited = {EXIT}
+        stack = [(EXIT, iter(preds[EXIT]))]
+        while stack:
+            node, children = stack[-1]
+            advanced = False
+            for child in children:
+                if child not in visited:
+                    visited.add(child)
+                    stack.append((child, iter(preds[child])))
+                    advanced = True
+                    break
+            if not advanced:
+                stack.pop()
+                order.append(node)
+        index = {node: position for position, node in enumerate(order)}
+        idom: dict[Any, Any] = {EXIT: EXIT}
+
+        def intersect(first: Any, second: Any) -> Any:
+            while first != second:
+                while index[first] < index[second]:
+                    first = idom[first]
+                while index[second] < index[first]:
+                    second = idom[second]
+            return first
+
+        changed = True
+        while changed:
+            changed = False
+            for node in reversed(order):
+                if node is EXIT:
+                    continue
+                candidate = None
+                for target in succ[node]:
+                    if target in idom:
+                        candidate = target if candidate is None else intersect(target, candidate)
+                if candidate is not None and idom.get(node) != candidate:
+                    idom[node] = candidate
+                    changed = True
+        idom.pop(EXIT, None)
+        return idom
+
+    def loop_members(self, header: Any, graph: dict[Any, list[DispatchPath]]) -> set[Any]:
+        """States on some cycle through header (reachable from it and able
+        to reach it again)."""
+        cached = self.loop_nodes.get(header)
+        if cached is not None:
+            return cached
+        succ = {key: self.successors(paths, graph) for key, paths in graph.items()}
+        forward: set[Any] = set()
+        pending = [header]
+        while pending:
+            node = pending.pop()
+            for target in succ.get(node, ()):
+                if target is not EXIT and target not in forward:
+                    forward.add(target)
+                    pending.append(target)
+        preds: dict[Any, list[Any]] = {}
+        for key, targets in succ.items():
+            for target in targets:
+                preds.setdefault(target, []).append(key)
+        backward: set[Any] = {header}
+        pending = [header]
+        while pending:
+            node = pending.pop()
+            for source in preds.get(node, ()):
+                if source not in backward:
+                    backward.add(source)
+                    pending.append(source)
+        members = (forward & backward) | {header}
+        self.loop_nodes[header] = members
+        return members
+
+    def join_for(self, key: Any, graph: dict[Any, list[DispatchPath]], stack: set[Any], loop_header: Any | None, inside: bool) -> Any | None:
+        """Where the branches of `key` reconverge, if it is safe to emit
+        them once each and the join after them. `inside` asks for a join
+        within the current loop body (vs. the loop's exit)."""
+        join = self.ipdom.get(key)
+        if join is None or join is EXIT or join in stack or join == key:
+            return None
+        if loop_header is not None:
+            members = self.loop_members(loop_header, graph)
+            if join == loop_header or (join in members) != inside:
+                return None
+        return join
+
+    def emit_state(self, value: int | float, graph: dict[Any, list[DispatchPath]], stack: set[Any], depth: int, loop_header: Any | None = None, in_loop: bool = False, stop: Any | None = None) -> list[Node] | None:
+        if depth > self.max_emit_depth:
             return None
         key = self.key(value)
+        if stop is not None and key == stop:
+            # reached the join of an enclosing branch; leaving the emitted
+            # loop on the way there needs an explicit break
+            if in_loop and loop_header is not None and key not in self.loop_members(loop_header, graph):
+                return [Node("break")]
+            return []
         if key in stack:
             if loop_header is not None and key == loop_header and in_loop:
                 return [Node("continue")]
@@ -797,20 +935,34 @@ class DispatcherPass:
         next_stack = set(stack)
         next_stack.add(key)
         if loop_header is not None and key == loop_header and not in_loop:
-            body = self.emit_paths(paths, graph, next_stack, depth + 1, True, loop_header)
+            follow = self.join_for(key, graph, next_stack, loop_header, False)
+            body = self.emit_paths(paths, graph, next_stack, depth + 1, True, loop_header, follow)
             if body is None:
                 return None
-            return [Node("while", cond=Node("bool", value=True), body=body)]
-        return self.emit_paths(paths, graph, next_stack, depth, in_loop, loop_header)
+            loop = [Node("while", cond=Node("bool", value=True), body=body)]
+            if follow is None:
+                return loop
+            rest = self.emit_state(follow[1], graph, next_stack, depth + 1, loop_header, in_loop, stop)
+            return None if rest is None else loop + rest
+        join = None
+        if len(paths) > 1 and (stop is None or self.ipdom.get(key) != stop):
+            join = self.join_for(key, graph, next_stack, loop_header if in_loop else None, True)
+        if join is None:
+            return self.emit_paths(paths, graph, next_stack, depth, in_loop, loop_header, stop)
+        branches = self.emit_paths(paths, graph, next_stack, depth, in_loop, loop_header, join)
+        if branches is None:
+            return None
+        rest = self.emit_state(join[1], graph, next_stack, depth + 1, loop_header, in_loop, stop)
+        return None if rest is None else branches + rest
 
-    def emit_paths(self, paths: list[DispatchPath], graph: dict[Any, list[DispatchPath]], stack: set[Any], depth: int, in_loop: bool = False, loop_header: Any | None = None) -> list[Node] | None:
+    def emit_paths(self, paths: list[DispatchPath], graph: dict[Any, list[DispatchPath]], stack: set[Any], depth: int, in_loop: bool = False, loop_header: Any | None = None, stop: Any | None = None) -> list[Node] | None:
         if not paths:
             return []
         self.emit_budget -= 1
         if self.emit_budget < 0:
             raise DispatcherBail("emit budget")
         if len(paths) == 1 and not paths[0].conditions:
-            return self.emit_path(paths[0], graph, stack, depth, in_loop, loop_header)
+            return self.emit_path(paths[0], graph, stack, depth, in_loop, loop_header, stop)
         unconditional = [path for path in paths if not path.conditions]
         conditional = [path for path in paths if path.conditions]
         if unconditional and conditional:
@@ -823,51 +975,85 @@ class DispatcherPass:
                 false_paths = unconditional
             if not true_paths or not false_paths or len(unconditional) > 1:
                 return None
-            true_paths = [DispatchPath(path.conditions[1:], path.actions, path.outcome, path.env) for path in true_paths]
-            false_paths = [DispatchPath(path.conditions[1:], path.actions, path.outcome, path.env) for path in false_paths]
-            then_body = self.emit_paths(true_paths, graph, set(stack), depth + 1, in_loop, loop_header)
-            else_body = self.emit_paths(false_paths, graph, set(stack), depth + 1, in_loop, loop_header)
-            if then_body is None or else_body is None:
+            offset = conditional[0].conditions[0][2]
+        else:
+            condition = paths[0].conditions[0][0] if paths[0].conditions else None
+            if condition is None:
                 return None
-            return [Node("if", condition.start, condition.end, cond=condition, then=then_body, elifs=[], else_=else_body)]
-        condition = paths[0].conditions[0][0] if paths[0].conditions else None
-        if condition is None:
+            true_paths = [path for path in paths if path.conditions and path.conditions[0][0] is condition and path.conditions[0][1]]
+            false_paths = [path for path in paths if path.conditions and path.conditions[0][0] is condition and not path.conditions[0][1]]
+            if not true_paths or not false_paths:
+                return None
+            offset = paths[0].conditions[0][2]
+        # Actions that ran before the branch are shared (same node objects)
+        # by every path through it; emit them once, ahead of the test.
+        prefix = self.shared_prefix(true_paths + false_paths, offset)
+        if prefix is None:
             return None
-        true_paths = [path for path in paths if path.conditions and path.conditions[0][0] is condition and path.conditions[0][1]]
-        false_paths = [path for path in paths if path.conditions and path.conditions[0][0] is condition and not path.conditions[0][1]]
-        if not true_paths or not false_paths:
-            return None
-        true_paths = [DispatchPath(path.conditions[1:], path.actions, path.outcome, path.env) for path in true_paths]
-        false_paths = [DispatchPath(path.conditions[1:], path.actions, path.outcome, path.env) for path in false_paths]
-        then_body = self.emit_paths(true_paths, graph, set(stack), depth + 1, in_loop, loop_header)
-        else_body = self.emit_paths(false_paths, graph, set(stack), depth + 1, in_loop, loop_header)
+        true_paths = [self.advance(path, offset) for path in true_paths]
+        false_paths = [self.advance(path, offset) for path in false_paths]
+        then_body = self.emit_paths(true_paths, graph, set(stack), depth + 1, in_loop, loop_header, stop)
+        else_body = self.emit_paths(false_paths, graph, set(stack), depth + 1, in_loop, loop_header, stop)
         if then_body is None or else_body is None:
             return None
-        return [Node("if", condition.start, condition.end, cond=condition, then=then_body, elifs=[], else_=else_body)]
+        branch = Node("if", condition.start, condition.end, cond=condition, then=then_body, elifs=[], else_=else_body)
+        return self.wrap_actions(self.clone_actions(prefix), [branch])
 
-    def emit_path(self, path: DispatchPath, graph: dict[Any, list[DispatchPath]], stack: set[Any], depth: int, in_loop: bool = False, loop_header: Any | None = None) -> list[Node] | None:
-        self.emit_budget -= len(path.actions) + 2
+    def shared_prefix(self, paths: list[DispatchPath], offset: int) -> list[Node] | None:
+        first = paths[0]
+        prefix = first.actions[first.consumed:offset]
+        for path in paths[1:]:
+            other = path.actions[path.consumed:offset]
+            if path.consumed != first.consumed or len(other) != len(prefix) or any(a is not b for a, b in zip(prefix, other)):
+                return None
+        return prefix
+
+    def advance(self, path: DispatchPath, offset: int) -> DispatchPath:
+        conditions = path.conditions[1:] if path.conditions else []
+        return DispatchPath(conditions, path.actions, path.outcome, path.env, max(path.consumed, offset))
+
+    def clone_actions(self, actions: list[Node]) -> list[Node]:
+        self.emit_budget -= len(actions)
         if self.emit_budget < 0:
             raise DispatcherBail("emit budget")
-        actions = [action.clone() for action in path.actions]
-        self.emit_nodes += sum(count_nodes(action) for action in actions) + 1
+        cloned = [action.clone() for action in actions]
+        self.emit_nodes += sum(count_nodes(action) for action in cloned)
         if self.emit_nodes > self.max_emit_nodes:
             raise DispatcherBail("emit size")
-        if actions and any(action.kind in {"local", "localfunc"} for action in actions):
-            actions = [Node("do", actions[0].start, actions[-1].end, body=actions)]
+        return cloned
+
+    def wrap_actions(self, actions: list[Node], tail: list[Node]) -> list[Node]:
+        """Locals declared by a state's actions stay scoped to that state,
+        but whatever follows them on the same path (branch test, return
+        values, successor) may still read them, so it goes in the block."""
+        declared: set[str] = set()
+        for action in actions:
+            if action.kind == "local":
+                declared.update(action.get("names", []))
+            elif action.kind == "localfunc":
+                declared.add(action.get("name"))
+        if not declared:
+            return actions + tail
+        # only pull the tail into the block when it reads one of these
+        # locals; otherwise keep it outside so it cannot be shadowed
+        if any(node.kind == "name" and node.get("name") in declared for item in tail for node in walk(item)):
+            return [Node("do", actions[0].start, actions[-1].end, body=actions + tail)]
+        return [Node("do", actions[0].start, actions[-1].end, body=actions)] + tail
+
+    def emit_path(self, path: DispatchPath, graph: dict[Any, list[DispatchPath]], stack: set[Any], depth: int, in_loop: bool = False, loop_header: Any | None = None, stop: Any | None = None) -> list[Node] | None:
+        self.emit_budget -= 2
+        actions = self.clone_actions(path.actions[path.consumed:])
+        self.emit_nodes += 1
         outcome = path.outcome
         if outcome[0] == "dead":
-            return actions
+            return self.wrap_actions(actions, [])
         if outcome[0] == "break":
-            if in_loop:
-                actions.append(Node("break"))
-            return actions
+            return self.wrap_actions(actions, [Node("break")] if in_loop else [])
         if outcome[0] == "return":
-            actions.append(Node("return", actions[-1].end if actions else 0, values=[value.clone() for value in outcome[1]]))
-            return actions
+            return self.wrap_actions(actions, [Node("return", actions[-1].end if actions else 0, values=[value.clone() for value in outcome[1]])])
         if outcome[0] != "edge":
             return None
-        successor = self.emit_state(outcome[1], graph, stack, depth + 1, loop_header, in_loop)
+        successor = self.emit_state(outcome[1], graph, stack, depth + 1, loop_header, in_loop, stop)
         if successor is None:
             return None
-        return actions + successor
+        return self.wrap_actions(actions, successor)

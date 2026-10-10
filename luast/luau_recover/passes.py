@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator
 
 from .analysis import Analyzer, Binding, analyze, binding_for, is_pure
+from .hashcmp import simplify_hash_compare
 from .model import Node, children, clone_value, iter_nodes, walk
 
 
@@ -137,6 +138,7 @@ class PassStats:
     states_recovered: int = 0
     names_renamed: int = 0
     aliases_restored: int = 0
+    pool_shuffles: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -680,6 +682,9 @@ def fold_constants(root: Node, analyzer: Analyzer, stats: PassStats, rounds: int
                     changed[0] = True
                     stats.branches_removed += 1
                     return Node("do", node.start, node.end, body=selected)
+                if collapse_repeated_tests(node, analyzer):
+                    changed[0] = True
+                    stats.branches_removed += 1
                 return node
             if node.kind == "while":
                 condition = evaluate(node.get("cond"), environment, analyzer)
@@ -707,6 +712,12 @@ def fold_constants(root: Node, analyzer: Analyzer, stats: PassStats, rounds: int
                 return node
             if node.kind in {"number", "string", "bool", "nil", "name", "vararg", "interpolated", "opaque"}:
                 return node
+            if node.kind == "call":
+                simplified = simplify_hash_compare(node, is_pure)
+                if simplified is not None:
+                    stats.folded += 1
+                    changed[0] = True
+                    return simplified
             result = evaluate(node, environment, analyzer)
             if result is not UNKNOWN and not is_phi(result):
                 replacement = value_node(result)
@@ -721,6 +732,47 @@ def fold_constants(root: Node, analyzer: Analyzer, stats: PassStats, rounds: int
         if not changed[0]:
             break
     return root
+
+
+def _tested_binding(condition: Node | None, analyzer: Analyzer) -> Binding | None:
+    while isinstance(condition, Node) and condition.kind == "paren":
+        condition = condition.get("expr")
+    if isinstance(condition, Node) and condition.kind == "name":
+        return binding_for(analyzer, condition)
+    return None
+
+
+def _inline_branch(body: list[Node], rest: list[Node], node: Node) -> list[Node]:
+    if any(statement.kind in {"local", "localfunc"} for statement in body):
+        return [Node("do", node.start, node.end, body=body)] + rest
+    return body + rest
+
+
+def collapse_repeated_tests(node: Node, analyzer: Analyzer) -> bool:
+    """`if x then if x then A else B end ... end` -> `if x then A ... end`.
+
+    Dispatcher recovery re-tests a local when several states branch on it
+    (luast v1.1 `s = if v then .. else ..` chains). A nested test of the
+    same local that is the *first* statement of a branch is decided by the
+    enclosing test: nothing runs in between that could change it."""
+    binding = _tested_binding(node.get("cond"), analyzer)
+    if binding is None:
+        return False
+    changed = False
+    then_body = node.get("then", [])
+    while then_body and then_body[0].kind == "if" and _tested_binding(then_body[0].get("cond"), analyzer) is binding:
+        then_body = _inline_branch(then_body[0].get("then", []), then_body[1:], then_body[0])
+        changed = True
+    else_body = node.get("else_", []) if not node.get("elifs") else None
+    while else_body and else_body[0].kind == "if" and not else_body[0].get("elifs") \
+            and _tested_binding(else_body[0].get("cond"), analyzer) is binding:
+        else_body = _inline_branch(else_body[0].get("else_", []), else_body[1:], else_body[0])
+        changed = True
+    if changed:
+        node.fields["then"] = then_body
+        if else_body is not None:
+            node.fields["else_"] = else_body
+    return changed
 
 
 def propagate_locals(root: Node, analyzer: Analyzer, stats: PassStats) -> Node:
@@ -1168,6 +1220,10 @@ def remove_dead_pool_writes(root: Node, analyzer: Analyzer, stats: PassStats) ->
         chain.pop()
 
     visit_names(root)
+    # Literal-key reads that survived resolution (the slot holds `game`, a
+    # closure, a table...) still need the pool and its aliases declared,
+    # even though they do not pin individual slot writes.
+    referenced = alive | {root_id for root_id, keys in key_reads.items() if keys}
 
     def pool_root_of(node: Node | None) -> int | None:
         if not isinstance(node, Node) or node.kind != "name":
@@ -1197,7 +1253,7 @@ def remove_dead_pool_writes(root: Node, analyzer: Analyzer, stats: PassStats) ->
                             binding = binding_for(analyzer, target)
                             if binding is not None and binding.reads == 0 and binding.writes == 1:
                                 root_id = aliases.get(binding.ident, binding.ident)
-                                if root_id in roots and root_id not in alive:
+                                if root_id in roots and root_id not in referenced:
                                     removed += 1
                                     continue
                             droppable = False
@@ -1228,10 +1284,10 @@ def remove_dead_pool_writes(root: Node, analyzer: Analyzer, stats: PassStats) ->
                 if len(bindings) == 1 and len(values) == 1:
                     binding = bindings[0]
                     root_id = aliases.get(binding.ident, binding.ident)
-                    if values[0].kind == "table" and root_id in roots and root_id not in alive:
+                    if values[0].kind == "table" and root_id in roots and root_id not in referenced:
                         removed += 1
                         continue
-                    if values[0].kind == "name" and binding.ident in aliases and aliases[binding.ident] in roots and aliases[binding.ident] not in alive:
+                    if values[0].kind == "name" and binding.ident in aliases and aliases[binding.ident] in roots and aliases[binding.ident] not in referenced:
                         removed += 1
                         continue
             elif kind in {"do", "while", "repeat", "if", "fornum", "forin", "localfunc", "funcdef", "function"}:
@@ -1333,6 +1389,13 @@ class PoolResolver:
         self.table_state_memo: dict[int, dict[tuple[Any, ...], Node]] = {}
         self.bare_local_candidates = False
         self.safe = True
+        # Flow-sensitivity guards (see slot_resolvable): slot paths written
+        # anywhere but straight-line top-level code, roots hit by unknown-key
+        # writes, and the last top-level write position per path.
+        self.volatile_paths: set[tuple[int, tuple[Any, ...]]] = set()
+        self.volatile_roots: set[int] = set()
+        self.last_write: dict[tuple[int, tuple[Any, ...]], int] = {}
+        self.top_level_ids: set[int] = set()
         self.discover()
 
     def invalidate(self, position: int) -> None:
@@ -1408,10 +1471,14 @@ class PoolResolver:
             self.alias_bases[ident] = expression
             self.alias_base_decl[ident] = decl_end
             self.alias_keys[ident] = (root_id, tuple(path))
+        write_sites: list[tuple[Node, Node, bool]] = []
         for node in walk_unique(self.root):
             if node.kind == "assign":
                 targets = node.get("targets", [])
                 values = node.get("values", [])
+                for target_index, target in enumerate(targets):
+                    if target.kind == "index":
+                        write_sites.append((node, target, target_index < len(values) and len(targets) == len(values)))
                 if targets and len(targets) != len(values):
                     if any(target.kind == "index" for target in targets):
                         self.invalidate(node.start)
@@ -1479,6 +1546,7 @@ class PoolResolver:
             # slot does (the alias captured the old table object).
             stable = not any(start > decl_end for start in write_positions.get((root_id, path[0]), []))
             self.alias_stable[ident] = stable
+        self.classify_writes(write_sites)
         self.parents = self.limited_parent_map()
         # With allow_escape the escape walk below is a no-op (it can only
         # clear self.safe, which allow_escape already overrides).
@@ -1493,6 +1561,78 @@ class PoolResolver:
             for _, body in node.fields.get("elifs", []):
                 if isinstance(body, list):
                     self.statement_nodes.update(id(item) for item in body if isinstance(item, Node))
+
+    def classify_writes(self, write_sites: list[tuple[Node, Node, bool]]) -> None:
+        """Source-order replay of pool writes is only sound for writes that
+        run exactly once, in order: statements directly in the chunk body.
+        A slot rewritten inside a loop, branch or function (luast v1.0.1
+        keeps registers such as the dispatcher state in table slots) has no
+        single value at a given read, so it is never resolved."""
+        top_statements = {id(statement) for statement in self.root.get("body", [])}
+        for statement in self.root.get("body", []):
+            if statement.kind not in {"local", "assign", "call", "methodcall", "return"}:
+                continue
+            stack = [statement]
+            while stack:
+                current = stack.pop()
+                if current.kind == "function":
+                    continue
+                self.top_level_ids.add(id(current))
+                for value in current.fields.values():
+                    if isinstance(value, Node):
+                        stack.append(value)
+                    elif isinstance(value, (list, tuple)):
+                        for item in value:
+                            if isinstance(item, Node):
+                                stack.append(item)
+                            elif isinstance(item, (list, tuple)):
+                                stack.extend(nested for nested in item if isinstance(nested, Node))
+        for statement, target, paired in write_sites:
+            path_info = self.write_path(target)
+            if path_info is None:
+                root_id = self.root_of_base(target.get("obj"))
+                if root_id is not None:
+                    # unknown key (or an unstable alias): any slot may change
+                    self.volatile_roots.add(root_id)
+                continue
+            root_id, path = path_info
+            key = (root_id, tuple(path))
+            if not paired or id(statement) not in top_statements:
+                self.volatile_paths.add(key)
+            else:
+                self.last_write[key] = max(self.last_write.get(key, -1), statement.start)
+
+    def root_of_base(self, base: Node | None) -> int | None:
+        if not isinstance(base, Node):
+            return None
+        if base.kind == "index":
+            return self._index_root(base)
+        if base.kind != "name":
+            return None
+        owner = self.alias_owner_of(base)
+        if owner is not None:
+            return self.alias_keys[owner][0]
+        binding = binding_for(self.analyzer, base)
+        if binding is None:
+            return None
+        root_id = self.aliases.get(binding.ident, binding.ident)
+        return root_id if root_id in self.roots else None
+
+    def slot_resolvable(self, read: Node, root_id: int | None, path: tuple[Any, ...] | None) -> bool:
+        if root_id is None or path is None:
+            return True
+        if root_id in self.volatile_roots:
+            return False
+        nested = id(read) not in self.top_level_ids
+        for length in range(1, len(path) + 1):
+            key = (root_id, tuple(path[:length]))
+            if key in self.volatile_paths:
+                return False
+            # code outside the top-level sequence may run at any later time:
+            # only the final value of the slot is certain for it
+            if nested and self.last_write.get(key, -1) > read.start:
+                return False
+        return True
 
     def _escape_check(self) -> None:
         """A pool name read outside an index/key or alias position escapes
@@ -1855,6 +1995,8 @@ class PoolResolver:
             resolved = None
             if root_id is not None:
                 path = self._index_path(read)
+                if not self.slot_resolvable(read, root_id, path):
+                    continue
                 if path is not None and len(path) >= 2:
                     overlay = self.nested_overlays.get((root_id, path[:-1]))
                     if overlay is not None:
@@ -1862,6 +2004,13 @@ class PoolResolver:
                 if resolved is None:
                     resolved = self.resolve_value(read, states[root_id])
             else:
+                owner = self.alias_owner_of(base) if isinstance(base, Node) and base.kind == "name" else None
+                if owner is not None:
+                    alias_root, alias_path = self.alias_keys[owner]
+                    read_key = self.key_for(read.get("key"))
+                    full_path = tuple(alias_path) + ((read_key,) if read_key is not None else ())
+                    if not self.slot_resolvable(read, alias_root, full_path):
+                        continue
                 resolved = self.resolve_alias_read(read, states)
             if resolved is None:
                 continue
@@ -2245,7 +2394,8 @@ def rename_bindings(root: Node, analyzer: Analyzer, stats: PassStats) -> Node:
             for index, binding in enumerate(analyzer.loop_bindings.get(id(node), [])):
                 if binding.ident in names and index < len(values):
                     values[index] = names[binding.ident]
-        elif node.kind in {"function", "localfunc", "funcdef"}:
+        # not an elif: `localfunc` also takes the name branch above
+        if node.kind in {"function", "localfunc", "funcdef"}:
             for index, binding in enumerate(analyzer.parameter_bindings.get(id(node), [])):
                 if binding.ident in names and index < len(node.get("params", [])):
                     node.fields["params"][index] = names[binding.ident]

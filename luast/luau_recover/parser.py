@@ -337,10 +337,39 @@ class Parser:
             values = [] if self.at_statement_end() else self.parse_expression_list()
             if not values or any(target.kind not in {"name", "index", "indexname"} for target in targets):
                 self.error("invalid assignment", self.peek())
+            desugared = self.desugar_compound(start, targets, values, operator)
+            if desugared is not None:
+                return desugared
             return self.make("assign", start, targets=targets, values=values, op=operator)
         if first.kind not in ("call", "methodcall"):
             self.error("expected assignment or function call", self.peek())
         return first
+
+    def desugar_compound(self, start: int, targets: list[Node], values: list[Node], operator: str) -> Node | None:
+        """Rewrite `x op= e` as `x = x op e` (tagged `compound=op`).
+
+        Every analysis/pass reads plain `assign` nodes as `target = value`;
+        leaving the compound operator on the node made them treat `s += K`
+        as `s = K` (luast v1.1 dispatchers step their state that way).
+        Only targets whose re-evaluation is side-effect free are rewritten;
+        the emitter re-sugars the tagged form."""
+        binary = operator[:-1]
+        if binary not in PRECEDENCE or len(targets) != 1 or len(values) != 1:
+            return None
+        target = targets[0]
+        if target.kind == "index":
+            if not self.simple_operand(target.get("obj")) or not self.simple_operand(target.get("key")):
+                return None
+        elif target.kind == "indexname":
+            if not self.simple_operand(target.get("obj")):
+                return None
+        elif target.kind != "name":
+            return None
+        value = self.make("binop", values[0].start, op=binary, left=target.clone(), right=values[0])
+        return self.make("assign", start, targets=targets, values=[value], op="=", compound=operator)
+
+    def simple_operand(self, node: Node | None) -> bool:
+        return isinstance(node, Node) and node.kind in {"name", "number", "string"}
 
     def parse_expression_list(self) -> list[Node]:
         result = [self.parse_expression()]

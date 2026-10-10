@@ -54,6 +54,15 @@ class Emitter:
             targets = ", ".join(self.expr(target) for target in node.get("targets", []))
             values = ", ".join(self.expr(value) for value in node.get("values", []))
             operator = node.get("op") or "="
+            compound = node.get("compound")
+            value_nodes = node.get("values", [])
+            if compound and operator == "=" and len(value_nodes) == 1:
+                # re-sugar a parser-desugared `x = x op e` while it still has that shape
+                value = value_nodes[0]
+                if isinstance(value, Node) and value.kind == "binop" and value.get("op") == compound[:-1] \
+                        and self.expr(value.get("left")) == targets:
+                    operator = compound
+                    values = self.expr(value.get("right"))
             suffix = (" = " + values) if operator == "=" else (" " + operator + " " + values)
             return pad + targets + suffix + ";"
         if kind in ("call", "methodcall"):

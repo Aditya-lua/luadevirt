@@ -45,6 +45,11 @@ class Analyzer:
         root_scope = self.new_scope(None)
         self.scope_by_node[id(self.root)] = root_scope
         self.block(self.root.get("body", []), root_scope, self.root)
+        # Every map above is keyed by id(node). Keep the nodes alive for the
+        # analyzer's lifetime: a pass that replaces a subtree would otherwise
+        # free them, and CPython hands their ids to freshly cloned nodes,
+        # which then resolve to stale bindings (nondeterministic output).
+        self.pinned = list(walk(self.root))
         return self
 
     def new_scope(self, parent: Scope | None) -> Scope:
